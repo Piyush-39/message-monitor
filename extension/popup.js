@@ -30,6 +30,8 @@ async function render(notice = '') {
     heading.textContent = new URL(run.tenant).hostname;
     const detail = document.createElement('p');
     detail.textContent = `${run.status}\nEnds: ${new Date(run.endsAt).toLocaleTimeString()}\nFailed messages emailed: ${run.sent}`;
+    detail.textContent += `\nArtifacts: ${run.scope?.artifactIds?.length ? run.scope.artifactIds.join(', ') : 'All'}`;
+    if (run.scope?.packageId) detail.textContent += `\nPackage: ${run.scope.packageId}`;
     if (run.lastCheck) detail.textContent += `\nLast check: ${new Date(run.lastCheck).toLocaleTimeString()}`;
     if (run.lastRefresh) detail.textContent += `\nLast table refresh: ${new Date(run.lastRefresh).toLocaleTimeString()}`;
     if (run.tableRefresh === false) detail.textContent += '\nTable refresh unavailable; email checks continue.';

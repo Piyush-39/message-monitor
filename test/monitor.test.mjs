@@ -116,15 +116,22 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
     h = await backgroundHarness({relayFetch: (url, options) => nativeFetch(`${base}${new URL(url).pathname}`, options)});
+    h.tabs.get(1).url += encodeURIComponent(JSON.stringify({artifactIds: ['selected-flow'], packageId: 'selected-package'}));
     assert.equal((await h.start()).ok, true);
     assert.equal((await h.start(TRIAL_TENANT)).ok, true);
-    for (const tenant of [TENANT, TRIAL_TENANT]) h.sap.set(tenant, [message('same-id')]);
+    h.sap.set(TENANT, [
+      {...message('same-id'), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'selected-package'}},
+      {...message('excluded-flow'), IntegrationArtifact: {Id: 'other-flow', PackageId: 'selected-package'}},
+      {...message('excluded-package'), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'other-package'}}
+    ]);
+    h.sap.set(TRIAL_TENANT, [message('same-id')]);
     h.time += 60000;
     await h.poll(); await h.poll();
     assert.equal(mails.length, 2);
     assert.ok(mails.every(mail => mail.to === 'recipient@gmail.com'));
     assert.ok(mails.some(mail => mail.subject.includes(new URL(TENANT).hostname)));
     assert.ok(mails.some(mail => mail.subject.includes(new URL(TRIAL_TENANT).hostname)));
+    assert.ok(mails.every(mail => /Message ID: same-id/.test(mail.text) && !/excluded-flow|excluded-package/.test(mail.text)));
     h.time += HEARTBEAT_TIMEOUT;
     await server.checkMonitoring(); await server.checkMonitoring();
     assert.equal(mails.length, 4);

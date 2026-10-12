@@ -1,4 +1,4 @@
-import { monitorTenant, isTenantOrigin, monitoringState, DURATION, POLL_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
+import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, DURATION, POLL_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
 import { readFailedMessages, refreshMessageTable } from './poll.js';
 
 const RELAY = 'http://127.0.0.1:43171';
@@ -45,7 +45,7 @@ async function read(run, since) {
   if (!(await chrome.permissions.contains({origins: [`${tenant}/*`]}))) throw new Error('Tenant access missing. Stop and click Start on this tenant to allow access.');
   const tab = await chrome.tabs.get(tabId);
   if (monitorTenant(tab.url) !== tenant) throw new Error('Watchdog tab closed or signed out. Sign in again in this tenant.');
-  const result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readFailedMessages, args: [since, tenant]});
+  const result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readFailedMessages, args: [since, tenant, run.scope || {}]});
   if (!Array.isArray(result[0]?.result)) throw new Error(result[0]?.error?.message || 'SAP check failed. Sign in again if the tab shows a login page.');
   return result[0].result;
 }
@@ -86,16 +86,15 @@ async function start(token, sourceTabId) {
   const tenant = monitorTenant(source?.url);
   if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
   if (activeRun(state.runs[tenant])) throw new Error('This tenant is already running. Other tenants can be added from their monitor tabs.');
+  const {filter, scope} = monitorSelection(source.url);
   if (state.runs[tenant]?.running) await stop(tenant, 'Nine-hour run finished');
   await relay('/health', token);
-  const baseline = await read({tenant, tabId: source.id}, Date.now() - 60 * 60 * 1000);
-  let filter = {};
-  try { filter = JSON.parse(decodeURIComponent(new URL(source.url).pathname.split('/Messages/')[1])); } catch { /* Bare monitor URLs are valid. */ }
-  filter = {...(filter.edge ? {edge: filter.edge} : {}), status: 'FAILED', time: 'PASTHOUR'};
-  const tab = await chrome.tabs.create({url: `${tenant}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(filter))}`, active: false});
+  const baseline = await read({tenant, tabId: source.id, scope}, Date.now() - 60 * 60 * 1000);
+  const watchdogFilter = {...filter, status: 'FAILED', time: 'PASTHOUR'};
+  const tab = await chrome.tabs.create({url: `${tenant}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(watchdogFilter))}`, active: false});
   const startedAt = Date.now();
   const run = {
-    running: true, token, tenant, tabId: tab.id, startedAt, endsAt: startedAt + DURATION,
+    running: true, token, tenant, scope, tabId: tab.id, startedAt, endsAt: startedAt + DURATION,
     seen: baseline.map(message => message.id), sent: 0, lastCheck: startedAt,
     status: 'Watching', problem: null, problemEpisode: null
   };

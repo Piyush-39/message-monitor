@@ -9,6 +9,38 @@ async function fixture(action, options) {
   const h = await backgroundHarness(options);
   try {await action(h);} finally {h.close();}
 }
+test('selected iFlows scope baselines, watchdog URLs and emails independently across tenants and restarts', () => fixture(async h => {
+  const selected = (id, artifact, pkg) => ({...message(id), IntegrationArtifact: {Id: artifact, PackageId: pkg, Name: 'Same display name'}});
+  for (const [tabId, tenant, artifact, pkg] of [[1, TENANT, 'flow-a', 'package-a'], [2, TRIAL_TENANT, 'flow-b', 'package-b']]) {
+    h.tabs.get(tabId).url = `${tenant}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify({artifactIds: [artifact], packageId: pkg, time: 'PASTDAY', status: 'ALL', edge: 'runtime-a'}))}`;
+    h.sap.set(tenant, [selected('old-selected', artifact, pkg), selected('old-other', 'other-flow', pkg)]);
+    assert.equal((await h.start(tenant)).ok, true);
+    const run = h.store.state.runs[tenant];
+    assert.deepEqual(run.scope, {artifactIds: [artifact], packageId: pkg});
+    assert.deepEqual(run.seen, ['old-selected']);
+    const pageFilter = JSON.parse(decodeURIComponent(h.tabs.get(run.tabId).url.split('/Messages/')[1]));
+    assert.deepEqual(pageFilter, {artifactIds: [artifact], packageId: pkg, time: 'PASTHOUR', status: 'FAILED', edge: 'runtime-a'});
+    // Later edits to the original page must not silently change this run's saved selection.
+    h.tabs.get(tabId).url = `${tenant}/shell/monitoring/Messages/`;
+    h.sap.set(tenant, [selected('old-selected', artifact, pkg), selected('new-selected', artifact, pkg), selected('new-other', 'other-flow', pkg), selected('wrong-package', artifact, 'other-package')]);
+  }
+  await h.reload(); await h.poll();
+  assert.equal(h.delivered.length, 2);
+  for (const alert of h.delivered) assert.deepEqual(alert.messages.map(message => message.id), ['new-selected']);
+  for (const read of h.reads) {
+    const scope = h.store.state.runs[read.tenant].scope;
+    const filter = new URL(read.url).searchParams.get('$filter');
+    assert.ok(filter.includes(`IntegrationArtifact/Id eq '${scope.artifactIds[0]}'`));
+    assert.ok(filter.includes(`IntegrationArtifact/PackageId eq '${scope.packageId}'`));
+  }
+  await h.poll(); assert.equal(h.delivered.length, 2);
+}));
+test('invalid page selection prevents baseline reads and creation of an unrestricted run', () => fixture(async h => {
+  h.tabs.get(1).url = `${TENANT}/shell/monitoring/Messages/%7B`;
+  assert.equal((await h.start()).ok, false);
+  assert.equal(h.reads.length, 0);
+  assert.equal(Object.keys(h.store.state.runs).length, 0);
+}));
 test('two tenants have independent baselines, counters, links and delivery deduplication', () => fixture(async h => {
   h.sap.set(TENANT, [message('old-a')]);
   h.sap.set(TRIAL_TENANT, [message('old-b')]);

@@ -28,13 +28,15 @@ Create an app password at https://myaccount.google.com/apppasswords if you do no
 2. Enable Developer mode, choose **Load unpacked**, and select this folder's `extension` directory.
 3. Open the extension popup and paste the **relay key**, not the Gmail app password.
 4. Click **Send test email** and confirm that it arrives at your Gmail address.
-5. Open any tenant's IS **Monitor Message Processing** page and click **Start this tenant** in the extension popup. Allow access to that tenant when Chrome asks. Chrome remembers approved tenants; approval is required the first time you use a new tenant.
+5. Open any tenant's IS **Monitor Message Processing** page. Select the desired **Artifacts** and package, then click **Go** to apply the filters. Click **Start this tenant** in the extension popup. Allow access to that tenant when Chrome asks. Chrome remembers approved tenants; approval is required the first time you use a new tenant.
 6. Repeat step 5 from each additional tenant's monitor page. Existing runs keep monitoring. Each tenant appears as a separate card in the popup.
 7. Click **Open watchdog tab** or **Stop** on the card for the tenant you want to manage.
 
 Open each tenant in the same signed-in Chrome profile. Starting a second tenant does not stop the first. Stopping or finishing one run does not change another tenant's alarms or keep-awake request. Each tenant needs its own active login; different Chrome profiles require separate extension runs.
 
 The extension creates a dedicated background monitor tab. It reads the same `/odata/api/v1/MessageProcessingLogs` request observed on your tenant, with `Status eq 'FAILED'`. Leave that tab open. Do not start from an iFlow editor or a different Chrome profile.
+
+Each run captures the applied page's selected technical iFlow IDs (`artifactIds`) and package (`packageId`) when you click Start. The baseline, subsequent SAP queries and email results use that selection. Multiple selected iFlows are matched by ID; a package selection also restricts results to that package. **All** starts unrestricted monitoring. The popup lists the saved selection. The dedicated tab preserves these filters and uses Failed status with a rolling Past Hour window. To change a run's selection, Stop it, apply the new filters with Go, and Start again from that page. Changing the original tab's filters does not change an existing run.
 
 Email detection makes a fresh SAP request every minute and does not depend on the displayed table or manually clicking Refresh. The extension also invokes **Reload content** through the button's SAP UI5 press handler in the dedicated tab's Messages toolbar after each successful check, keeping that table current. A plain DOM click does not trigger this handler on the observed monitor; the extension uses the registered `sap.m.Button.firePress()` event ([SAP UI5 API](https://ui5.github.io/typescript/api/sapui5/1.148/sap.m/sap/m/Button/classes/Button.html)). Other open monitor tabs are not refreshed. The popup shows the last table-refresh time; if SAP changes its toolbar or the button is unavailable, email checks continue and the popup reports that table refresh is unavailable.
 
@@ -66,14 +68,16 @@ A relay that is force-killed, an offline computer, or an unavailable Gmail conne
 
 Restart the relay with the updated code before reloading the extension in `chrome://extensions`. The active single-tenant run migrates automatically with its original end time, sent count and seen message IDs. Then start additional tenants from their monitor pages. No new install-time Chrome permissions are required.
 
+For the **1.1.1 iFlow filter fix**, reload the extension, Stop any existing run that should be filtered, and Start again from its filtered page after clicking Go. Older runs have no saved artifact selection and continue monitoring all iFlows until restarted.
+
 ## Check the implementation
 
 ```sh
 npm test
 ```
 
-Automated tests cover simultaneous tenants with matching message IDs, independent Stop/expiry, slow or failed tenants, permission denial/revocation, worker restart and legacy state migration, missing table refresh, and persisted delivery receipts. An end-to-end test runs the actual serialized page reader against fake SAP responses, sends requests through the real authenticated HTTP relay, and checks mail delivery with a fake SMTP transport. Tests do not create SAP messages or send real Gmail email.
+Automated tests cover simultaneous tenants with matching message IDs, selected artifact/package baselines and polls, exact IDs despite identical display names, OData escaping, pagination filtering, malformed filters, independent Stop/expiry, slow or failed tenants, permission denial/revocation, worker restart and legacy state migration, missing table refresh, and persisted delivery receipts. An end-to-end test runs the actual serialized page reader against fake SAP responses, sends requests through the real authenticated HTTP relay, and checks mail delivery with a fake SMTP transport, including exclusion of unselected iFlows. Tests do not create SAP messages or send real Gmail email.
 
-Earlier versions were validated live on the trial tenant, including successful failure emails and automatic SAP table refresh. Version 1.1.0's concurrent tenant and outage behavior is covered by automated tests; simultaneous live tenant sessions and a full nine-hour shift still need live validation.
+Earlier versions were validated live on the trial tenant, including successful failure emails and automatic SAP table refresh. Version 1.1.1's artifact and package query was also checked read-only against an authenticated tenant: HTTP 200 with a result matching both selected IDs. Filtered email delivery, concurrent tenant and outage behavior are covered by automated tests; simultaneous live tenant sessions and a full nine-hour shift still need live validation.
 
 The relay binds only to `127.0.0.1:43171`, requires its random key, fixes the email recipient in `.env`, and accepts no SMTP password from the extension. The Gmail password stays outside the extension in the local `.env`; do not commit or share it. HTTPS host access is optional: Chrome grants access only to the individual tenants approved through Start, not to all websites. The active tab is inspected when you open the popup. SAP requests and pagination stay on the selected tenant; emailed message links must match it.

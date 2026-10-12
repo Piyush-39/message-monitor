@@ -12,6 +12,18 @@ export function monitorTenant(url) {
     return isTenantOrigin(parsed.origin) && !parsed.username && !parsed.password && /^\/shell\/monitoring\/Messages(?:\/|$)/.test(parsed.pathname) ? parsed.origin : null;
   } catch { return null; }
 }
+export function monitorSelection(url) {
+  if (!monitorTenant(url)) throw new Error('Open Monitor Message Processing first.');
+  const encoded = new URL(url).pathname.replace(/^\/shell\/monitoring\/Messages\/?/, '');
+  let filter = {};
+  try {if (encoded) filter = JSON.parse(decodeURIComponent(encoded));}
+  catch {throw new Error('Cannot read the monitor page filters. Apply the filters with Go and try again.');}
+  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) throw new Error('Invalid monitor page filters.');
+  const ids = filter.artifactIds === undefined || filter.artifactIds === 'ALL' ? [] : filter.artifactIds;
+  if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id || id.length > 512)) throw new Error('Cannot read the selected artifact IDs. Apply the filters with Go and try again.');
+  if (filter.packageId !== undefined && (typeof filter.packageId !== 'string' || filter.packageId.length > 512)) throw new Error('Cannot read the selected package.');
+  return {filter, scope: {artifactIds: [...new Set(ids)], packageId: filter.packageId && filter.packageId !== 'ALL' ? filter.packageId : null}};
+}
 export const DURATION = 9 * 60 * 60 * 1000;
 export const POLL_ALARM = 'is-watchdog-poll';
 export const END_ALARM = 'is-watchdog-end';

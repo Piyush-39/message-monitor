@@ -18,7 +18,8 @@ test('popup adds a second tenant with scoped permission and targets independent 
   };
   const calls = [];
   let granted = false;
-  const initial = {tenant: TRIAL_TENANT, running: true, status: 'Watching', endsAt: Date.now() + 3600000, sent: 3};
+  const initial = {tenant: TRIAL_TENANT, running: true, status: 'Watching', endsAt: Date.now() + 3600000, sent: 3,
+    scope: {artifactIds: ['flow-a', 'flow-b'], packageId: 'package-a'}};
   const state = {runs: [initial], activeCount: 1};
   globalThis.chrome = {
     tabs: {async query() {return [{id: 42, url: `${TENANT}/shell/monitoring/Messages/`}];}},
@@ -46,6 +47,7 @@ test('popup adds a second tenant with scoped permission and targets independent 
   assert.equal(elements.runs.children.length, 2);
   const firstCard = elements.runs.children[0];
   assert.equal(firstCard.children[0].textContent, new URL(TRIAL_TENANT).hostname);
+  assert.match(firstCard.children[1].textContent, /Artifacts: flow-a, flow-b\nPackage: package-a/);
   const open = flatten(firstCard).find(node => node.textContent === 'Open watchdog tab');
   calls.length = 0; await open.click();
   assert.equal(calls[0].message.tenant, TRIAL_TENANT);

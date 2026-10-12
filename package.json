@@ -1,0 +1,17 @@
+{
+  "name": "is-message-watchdog",
+  "version": "1.0.3",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "setup": "node relay/setup.mjs",
+    "start": "node --env-file=.env relay/server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "10.1.0"
+  }
+}

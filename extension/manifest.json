@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "IS Message Watchdog",
+  "version": "1.0.3",
+  "description": "Watch new failed Integration Suite messages for nine hours and email alerts using a local relay.",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "storage",
+    "scripting",
+    "notifications",
+    "power"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "IS Message Watchdog"
+  }
+}

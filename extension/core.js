@@ -15,6 +15,17 @@ export function monitorTenant(url) {
 export const DURATION = 9 * 60 * 60 * 1000;
 export const POLL_ALARM = 'is-watchdog-poll';
 export const END_ALARM = 'is-watchdog-end';
+export const endAlarm = tenant => `${END_ALARM}:${tenant}`;
+
+export function monitoringState(saved) {
+  if (saved?.version === 2) return saved;
+  const runs = {};
+  if (saved?.startedAt) {
+    const tenant = saved.tenant || LEGACY_TENANT;
+    runs[tenant] = {...saved, tenant};
+  }
+  return {version: 2, runs, pendingStops: []};
+}
 
 export function unseenMessages(messages, seen) {
   const ids = new Set(seen);

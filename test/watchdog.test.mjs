@@ -133,7 +133,7 @@ test('retries SMTP errors and suppresses duplicate/regrouped sends including per
   }});
 });
 test('test and monitoring-problem emails do not pretend a check succeeded', () => {
-  assert.match(composeEmail({kind: 'problem', problem: 'Session expired'}).text, /cannot currently confirm/);
+  assert.match(composeEmail({kind: 'problem', tenant: TENANT, problem: 'Session expired'}).text, /cannot currently confirm/);
   assert.match(composeEmail({kind: 'test'}).subject, /test email/);
 });
 test('trial-tenant alerts are accepted, links match the tenant, and receipts are isolated by tenant', async () => {

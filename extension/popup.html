@@ -1,12 +1,11 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>IS Message Watchdog</title><link rel="stylesheet" href="popup.css"></head>
 <body><h1>IS Message Watchdog</h1>
-<p>Check every minute for nine hours. Email new failed messages.</p>
+<p>Monitor multiple tenants every minute. Each tenant runs for nine hours and emails new failures.</p>
 <label for="token">Local email relay key</label>
 <input id="token" type="password" placeholder="From npm run setup" autocomplete="off">
-<div class="actions"><button id="start">Start 9 hours</button><button id="stop" class="secondary">Stop</button></div>
-<button id="open" class="secondary">Open watchdog tab</button>
-<button id="test" class="secondary">Send test email</button>
+<div class="actions"><button id="start">Start this tenant</button><button id="test" class="secondary">Send test email</button></div>
 <p id="status" role="status" aria-live="polite">Loading…</p>
-<p class="hint">Start from any tenant's Monitor Message Processing page and allow access when Chrome asks. Keep Chrome and the relay running. Sign in again in the watchdog tab if monitoring pauses.</p>
+<div id="runs" aria-label="Tenant monitoring runs"></div>
+<p class="hint">Open each tenant's Monitor Message Processing page and click Start. Keep Chrome and the relay running. Missing heartbeats trigger an email after three minutes.</p>
 <script type="module" src="popup.js"></script></body></html>

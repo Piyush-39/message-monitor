@@ -1,51 +1,75 @@
+import {monitorTenant} from './core.js';
+
 const status = document.querySelector('#status');
 const token = document.querySelector('#token');
-const buttons = [...document.querySelectorAll('button')];
-// Resolve before the click so permissions.request stays directly in the user gesture.
-document.querySelector('#start').disabled = true;
+const start = document.querySelector('#start');
+const test = document.querySelector('#test');
+const list = document.querySelector('#runs');
+let busy = false;
+start.disabled = true;
 const [source] = await chrome.tabs.query({active: true, currentWindow: true});
 const tenant = monitorTenant(source?.url);
-async function send(type) {
-  const result = await chrome.runtime.sendMessage({type, token: token.value.trim(), ...(type === 'start' ? {sourceTabId: source?.id} : {})});
+
+async function send(type, targetTenant) {
+  const result = await chrome.runtime.sendMessage({type, token: token.value.trim(),
+    ...(type === 'start' ? {sourceTabId: source?.id} : {}), ...(targetTenant ? {tenant: targetTenant} : {})});
   if (!result.ok) throw new Error(result.error);
   return result.value;
 }
-async function render() {
+async function render(notice = '') {
   const state = await send('status');
-  document.querySelector('#start').disabled = Boolean(state.running);
-  document.querySelector('#stop').disabled = !state.running;
-  document.querySelector('#open').disabled = !state.running;
-  status.textContent = state.status || 'Ready';
-  if (state.running) {
-    if (state.tenant) status.textContent += `\nTenant: ${new URL(state.tenant).hostname}`;
-    status.textContent += `\nEnds: ${new Date(state.endsAt).toLocaleTimeString()}\nFailed messages emailed: ${state.sent}`;
-    if (state.lastCheck) status.textContent += `\nLast check: ${new Date(state.lastCheck).toLocaleTimeString()}`;
-    if (state.lastRefresh) status.textContent += `\nLast table refresh: ${new Date(state.lastRefresh).toLocaleTimeString()}`;
-    if (state.tableRefresh === false) status.textContent += '\nTable refresh unavailable; email checks continue.';
+  const currentRunning = state.runs.some(run => run.tenant === tenant && run.running);
+  start.disabled = busy || currentRunning;
+  test.disabled = busy;
+  status.textContent = notice || `${state.activeCount} tenant${state.activeCount === 1 ? '' : 's'} running.\n${tenant ? `${currentRunning ? 'Already watching' : 'Ready to start'}: ${new URL(tenant).hostname}` : 'Open a tenant’s Monitor Message Processing page to add it.'}`;
+  list.replaceChildren();
+  for (const run of state.runs) {
+    const card = document.createElement('section');
+    card.className = 'run';
+    const heading = document.createElement('h2');
+    heading.textContent = new URL(run.tenant).hostname;
+    const detail = document.createElement('p');
+    detail.textContent = `${run.status}\nEnds: ${new Date(run.endsAt).toLocaleTimeString()}\nFailed messages emailed: ${run.sent}`;
+    if (run.lastCheck) detail.textContent += `\nLast check: ${new Date(run.lastCheck).toLocaleTimeString()}`;
+    if (run.lastRefresh) detail.textContent += `\nLast table refresh: ${new Date(run.lastRefresh).toLocaleTimeString()}`;
+    if (run.tableRefresh === false) detail.textContent += '\nTable refresh unavailable; email checks continue.';
+    if (run.problem) detail.textContent += `\n${run.problem}`;
+    card.append(heading, detail);
+    if (run.running) {
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      for (const [type, label] of [['open', 'Open watchdog tab'], ['stop', 'Stop']]) {
+        const button = document.createElement('button');
+        button.className = 'secondary';
+        button.textContent = label;
+        button.disabled = busy;
+        button.addEventListener('click', () => act(type, run.tenant));
+        actions.append(button);
+      }
+      card.append(actions);
+    }
+    list.append(card);
   }
-  if (state.problem) status.textContent += `\n${state.problem}`;
 }
-for (const button of buttons) button.addEventListener('click', async () => {
-  buttons.forEach(item => item.disabled = true);
+async function act(type, targetTenant) {
+  busy = true;
+  document.querySelectorAll('button').forEach(button => {button.disabled = true;});
+  let notice = '';
   try {
-    if (button.id === 'start') {
+    if (type === 'start') {
       if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
+      // Resolve the source before clicking; the permission request stays in the user gesture.
       if (!(await chrome.permissions.request({origins: [`${tenant}/*`]}))) throw new Error('Tenant access was declined. Click Start again and allow access to monitor this tenant.');
     }
-    const result = await send(button.id);
-    if (button.id === 'start') await chrome.storage.local.set({ relayToken: token.value.trim() });
-    await render();
-    if (button.id === 'test') status.textContent = result.status;
-  } catch (error) { status.textContent = error.message; }
+    const result = await send(type, targetTenant);
+    if (type === 'test') notice = result.status;
+  } catch (error) {notice = error.message;}
   finally {
-    const state = await send('status');
-    document.querySelector('#start').disabled = Boolean(state.running);
-    document.querySelector('#stop').disabled = !state.running;
-    document.querySelector('#open').disabled = !state.running;
-    document.querySelector('#test').disabled = false;
+    busy = false;
+    await render(notice);
   }
-});
-const saved = await chrome.storage.local.get('relayToken');
-token.value = saved.relayToken || '';
+}
+start.addEventListener('click', () => act('start'));
+test.addEventListener('click', () => act('test'));
+token.value = (await chrome.storage.local.get('relayToken')).relayToken || '';
 await render();
-import { monitorTenant } from './core.js';

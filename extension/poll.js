@@ -19,16 +19,24 @@ export function refreshMessageTable(expectedOrigin) {
   return true;
 }
 
-export async function readFailedMessages(since, expectedOrigin) {
+export async function readFailedMessages(since, expectedOrigin, scope = {}) {
   const origin = location.origin;
   if (origin !== expectedOrigin) {
     throw new Error('SAP tab has left the tenant. Sign in again.');
   }
   const url = new URL('/odata/api/v1/MessageProcessingLogs', origin);
+  const artifactIds = scope.artifactIds ?? [];
+  if (!Array.isArray(artifactIds) || artifactIds.some(id => typeof id !== 'string' || !id) ||
+      (scope.packageId != null && typeof scope.packageId !== 'string')) throw new Error('Invalid artifact monitoring scope.');
+  // OData string literals escape apostrophes by doubling them, not by URL encoding.
+  const literal = value => `'${value.replace(/'/g, "''")}'`;
+  const filters = [`Status eq 'FAILED' and LogEnd ge datetime'${new Date(since).toISOString().slice(0, 19)}'`];
+  if (artifactIds.length) filters.push(`(${artifactIds.map(id => `IntegrationArtifact/Id eq ${literal(id)}`).join(' or ')})`);
+  if (scope.packageId) filters.push(`IntegrationArtifact/PackageId eq ${literal(scope.packageId)}`);
   url.searchParams.set('$format', 'json');
   url.searchParams.set('$orderby', 'LogEnd desc');
   url.searchParams.set('$top', '50');
-  url.searchParams.set('$filter', `Status eq 'FAILED' and LogEnd ge datetime'${new Date(since).toISOString().slice(0, 19)}'`);
+  url.searchParams.set('$filter', filters.join(' and '));
   const messages = [];
   const visited = new Set();
   const deadline = Date.now() + 20000;
@@ -55,6 +63,11 @@ export async function readFailedMessages(since, expectedOrigin) {
     if (!Array.isArray(body.d?.results)) throw new Error('Unexpected SAP monitoring response.');
     for (const item of body.d.results) {
       if (item.Status !== 'FAILED') continue;
+      // Check every result too: a malformed/mis-scoped pagination response must not email other iFlows.
+      if (artifactIds.length && typeof item.IntegrationArtifact?.Id !== 'string') throw new Error('SAP returned a message without its artifact ID for filtered monitoring.');
+      if (scope.packageId && typeof item.IntegrationArtifact?.PackageId !== 'string') throw new Error('SAP returned a message without its package ID for filtered monitoring.');
+      if (artifactIds.length && !artifactIds.includes(item.IntegrationArtifact.Id)) continue;
+      if (scope.packageId && item.IntegrationArtifact.PackageId !== scope.packageId) continue;
       if (typeof item.MessageGuid !== 'string' || !item.MessageGuid) throw new Error('Failed message has no message ID.');
       const date = /\/Date\((\d+)(?:[+-]\d+)?\)\//.exec(item.LogEnd || '');
       messages.push({

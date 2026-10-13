@@ -1,23 +1,21 @@
-import { LEGACY_TENANT, isTenantOrigin, monitorTenant, DURATION, POLL_ALARM, END_ALARM, unseenMessages, activeRun } from './core.js';
+import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, DURATION, POLL_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
 import { readFailedMessages, refreshMessageTable } from './poll.js';
 
 const RELAY = 'http://127.0.0.1:43171';
+let state;
 let queue = Promise.resolve();
+let writes = Promise.resolve();
 function serialize(operation) {
   const result = queue.then(operation);
   queue = result.catch(() => {});
   return result;
 }
-async function load() { return (await chrome.storage.local.get('state')).state || {}; }
-async function save(state) { await chrome.storage.local.set({ state }); }
-async function badge(text, color) {
-  await chrome.action.setBadgeText({ text });
-  await chrome.action.setBadgeBackgroundColor({ color });
-}
-async function localNotice(message) {
-  await chrome.notifications.create('is-watchdog-problem', {
-    type: 'basic', iconUrl: 'icon.png', title: 'IS monitoring needs attention', message
-  });
+function save() {
+  // Concurrent tenant checks share state, but storage snapshots must commit in order.
+  const snapshot = structuredClone(state);
+  const result = writes.then(() => chrome.storage.local.set({state: snapshot}));
+  writes = result.catch(() => {});
+  return result;
 }
 async function relay(path, token, body) {
   if (!token) throw new Error('Paste the relay key from npm run setup first.');
@@ -25,153 +23,190 @@ async function relay(path, token, body) {
   try {
     response = await fetch(`${RELAY}${path}`, {
       method: body ? 'POST' : 'GET',
-      headers: { Authorization: `Bearer ${token}`, ...(body ? {'Content-Type': 'application/json'} : {}) },
+      headers: {Authorization: `Bearer ${token}`, ...(body ? {'Content-Type': 'application/json'} : {})},
       ...(body ? {body: JSON.stringify(body)} : {}), signal: AbortSignal.timeout(20000)
     });
   } catch { throw new Error('Email relay unavailable. Keep npm start running.'); }
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));
-    throw new Error(detail.error || `Email relay returned HTTP ${response.status}.`);
+    throw new Error(detail.error || `Email relay returned HTTP ${response.status}. Restart the updated relay if needed.`);
   }
   return response.json();
 }
-async function read(tabId, since, tenant) {
-  const tab = await chrome.tabs.get(tabId);
-  if (!isTenantOrigin(tenant)) throw new Error('Invalid tenant. Stop and start monitoring again.');
-  if (!(await chrome.permissions.contains({origins: [`${tenant}/*`]}))) throw new Error('Tenant access missing. Stop and click Start on the monitor page to allow access.');
-  if (monitorTenant(tab.url) !== tenant) throw new Error('Watchdog tab closed or signed out. Sign in again.');
-  const result = await chrome.scripting.executeScript({
-    target: { tabId }, world: 'MAIN', func: readFailedMessages, args: [since, tenant]
+function heartbeat(run, action = 'heartbeat', status = run.problem ? 'problem' : 'healthy') {
+  return relay('/monitor', run.token, {
+    action, tenant: run.tenant, run: run.startedAt, endsAt: run.endsAt,
+    lastCheck: run.lastCheck, status
   });
+}
+async function read(run, since) {
+  const {tenant, tabId} = run;
+  if (!isTenantOrigin(tenant)) throw new Error('Invalid tenant. Stop and start monitoring again.');
+  if (!(await chrome.permissions.contains({origins: [`${tenant}/*`]}))) throw new Error('Tenant access missing. Stop and click Start on this tenant to allow access.');
+  const tab = await chrome.tabs.get(tabId);
+  if (monitorTenant(tab.url) !== tenant) throw new Error('Watchdog tab closed or signed out. Sign in again in this tenant.');
+  const result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readFailedMessages, args: [since, tenant, run.scope || {}]});
   if (!Array.isArray(result[0]?.result)) throw new Error(result[0]?.error?.message || 'SAP check failed. Sign in again if the tab shows a login page.');
   return result[0].result;
 }
-async function stop(reason = 'Stopped') {
-  const state = await load();
-  state.running = false;
-  state.status = reason;
-  await save(state);
-  await chrome.alarms.clear(POLL_ALARM);
-  await chrome.alarms.clear(END_ALARM);
-  chrome.power.releaseKeepAwake();
-  await badge('', '#57606a');
-  // Keep the tab open so failed-message links and login recovery remain accessible.
+async function updateControls() {
+  const active = Object.values(state.runs).filter(run => activeRun(run));
+  if (active.length) chrome.power.requestKeepAwake('system');
+  else chrome.power.releaseKeepAwake();
+  const problem = active.some(run => run.problem);
+  await chrome.action.setBadgeText({text: problem ? '!' : active.length ? String(active.length) : ''});
+  await chrome.action.setBadgeBackgroundColor({color: problem ? '#b3261e' : '#137333'});
+  if (active.length || state.pendingStops.length) {
+    if (!(await chrome.alarms.get(POLL_ALARM))) await chrome.alarms.create(POLL_ALARM, {periodInMinutes: 1});
+  } else await chrome.alarms.clear(POLL_ALARM);
+}
+async function flushStops() {
+  await Promise.all([...state.pendingStops].map(async item => {
+    try {
+      await relay('/monitor', item.token, {action: 'stop', tenant: item.tenant, run: item.run});
+      state.pendingStops = state.pendingStops.filter(pending => pending !== item);
+      await save();
+    } catch { /* Persist and retry, including after Chrome/relay restart. */ }
+  }));
+}
+async function stop(tenant, reason = 'Stopped') {
+  const run = state.runs[tenant];
+  if (!run?.running) return {status: reason};
+  run.running = false;
+  run.status = reason;
+  state.pendingStops.push({tenant, run: run.startedAt, token: run.token});
+  await save();
+  await chrome.alarms.clear(endAlarm(tenant));
+  await flushStops();
+  await updateControls();
+  return {status: reason};
 }
 async function start(token, sourceTabId) {
-  const previous = await load();
-  if (activeRun(previous)) throw new Error('Already running. Stop before starting another run.');
-  const source = Number.isInteger(sourceTabId) ? await chrome.tabs.get(sourceTabId) : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+  const source = Number.isInteger(sourceTabId) ? await chrome.tabs.get(sourceTabId) : (await chrome.tabs.query({active: true, currentWindow: true}))[0];
   const tenant = monitorTenant(source?.url);
   if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
+  if (activeRun(state.runs[tenant])) throw new Error('This tenant is already running. Other tenants can be added from their monitor tabs.');
+  const {filter, scope} = monitorSelection(source.url);
+  if (state.runs[tenant]?.running) await stop(tenant, 'Nine-hour run finished');
   await relay('/health', token);
+  const baseline = await read({tenant, tabId: source.id, scope}, Date.now() - 60 * 60 * 1000);
+  const watchdogFilter = {...filter, status: 'FAILED', time: 'PASTHOUR'};
+  const tab = await chrome.tabs.create({url: `${tenant}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(watchdogFilter))}`, active: false});
   const startedAt = Date.now();
-  // Baseline existing failures, so Start does not email old messages.
-  const baseline = await read(source.id, startedAt - 60 * 60 * 1000, tenant);
-  let filter = {};
-  try { filter = JSON.parse(decodeURIComponent(new URL(source.url).pathname.split('/Messages/')[1])); } catch { /* A bare monitor URL is valid too. */ }
-  // Preserve the active runtime when present; trial tenants may have no runtime selector.
-  filter = {...(filter.edge ? {edge: filter.edge} : {}), status: 'FAILED', time: 'PASTHOUR'};
-  const tab = await chrome.tabs.create({ url: `${tenant}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(filter))}`, active: false });
-  const state = {
-    running: true, token, tenant, tabId: tab.id, startedAt, endsAt: startedAt + DURATION,
+  const run = {
+    running: true, token, tenant, scope, tabId: tab.id, startedAt, endsAt: startedAt + DURATION,
     seen: baseline.map(message => message.id), sent: 0, lastCheck: startedAt,
     status: 'Watching', problem: null, problemEpisode: null
   };
-  await save(state);
-  chrome.power.requestKeepAwake('system');
-  await chrome.alarms.create(POLL_ALARM, { periodInMinutes: 1 });
-  await chrome.alarms.create(END_ALARM, { when: state.endsAt });
-  await badge('ON', '#137333');
-  return { status: 'Watching' };
-}
-async function tick() {
-  const state = await load();
-  if (!activeRun(state)) { if (state.running) await stop('Nine-hour run finished'); return; }
+  state.runs[tenant] = run;
+  await save();
   try {
-    // Read the entire run plus overlap. This also catches late logs and gaps after sleep/login.
-    const tenant = state.tenant || LEGACY_TENANT;
-    const messages = await read(state.tabId, state.startedAt - 5 * 60 * 1000, tenant);
-    state.lastCheck = Date.now();
-    const fresh = unseenMessages(messages, state.seen);
-    for (let offset = 0; offset < fresh.length; offset += 50) {
-      if (Date.now() >= state.endsAt) { await save(state); await stop('Nine-hour run finished'); return; }
+    await heartbeat(run, 'start');
+    await chrome.alarms.create(endAlarm(tenant), {when: run.endsAt});
+    await updateControls();
+  } catch (error) {
+    await stop(tenant, 'Could not start');
+    throw error;
+  }
+  await chrome.storage.local.set({relayToken: token});
+  return {status: 'Watching', tenant};
+}
+async function tick(run) {
+  if (!activeRun(run)) {if (run.running) await stop(run.tenant, 'Nine-hour run finished'); return;}
+  try {
+    const messages = await read(run, run.startedAt - 5 * 60 * 1000);
+    run.lastCheck = Date.now();
+    for (let fresh = unseenMessages(messages, run.seen), offset = 0; offset < fresh.length; offset += 50) {
+      if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
       const batch = fresh.slice(offset, offset + 50);
-      await relay('/alert', state.token, { kind: 'failures', run: state.startedAt, tenant, messages: batch });
-      state.seen.push(...batch.map(message => message.id));
-      state.sent += batch.length;
-      await save(state); // Only mark sent after the relay has accepted delivery.
+      await relay('/alert', run.token, {kind: 'failures', run: run.startedAt, tenant: run.tenant, messages: batch});
+      run.seen.push(...batch.map(message => message.id));
+      run.sent += batch.length;
+      await save();
     }
-    // The UI table has its own cache. Refresh it too, independently of email detection.
+    if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
     try {
-      const refreshed = await chrome.scripting.executeScript({
-        target: {tabId: state.tabId}, world: 'MAIN', func: refreshMessageTable, args: [tenant]
-      });
-      state.tableRefresh = refreshed[0]?.result === true;
-      if (state.tableRefresh) state.lastRefresh = Date.now();
-    } catch { state.tableRefresh = false; }
-    state.problem = null;
-    state.problemEpisode = null;
-    state.status = 'Watching';
-    await save(state);
-    await badge('ON', '#137333');
+      const refreshed = await chrome.scripting.executeScript({target: {tabId: run.tabId}, world: 'MAIN', func: refreshMessageTable, args: [run.tenant]});
+      run.tableRefresh = refreshed[0]?.result === true;
+      if (run.tableRefresh) run.lastRefresh = Date.now();
+    } catch {run.tableRefresh = false;}
+    await heartbeat(run, 'heartbeat', 'healthy');
+    run.problem = null;
+    run.problemEpisode = null;
+    run.status = 'Watching';
+    await save();
   } catch (error) {
     const problem = String(error.message || error).slice(0, 400);
-    const first = !state.problemEpisode;
-    state.problem = problem;
-    state.status = 'Needs attention';
-    state.problemEpisode ||= { id: Date.now(), sent: false };
-    await save(state);
-    await badge('!', '#b3261e');
-    if (first) await localNotice(problem).catch(() => {});
-    if (!state.problemEpisode.sent) {
+    const first = !run.problemEpisode;
+    run.problem = problem;
+    run.status = 'Needs attention';
+    run.problemEpisode ||= {id: Date.now(), sent: false};
+    await save();
+    if (first) await chrome.notifications.create(`is-watchdog-problem:${run.tenant}`, {
+      type: 'basic', iconUrl: 'icon.png', title: `IS monitoring: ${new URL(run.tenant).hostname}`, message: problem
+    }).catch(() => {});
+    if (!run.problemEpisode.sent) {
       try {
-        await relay('/alert', state.token, {
-          kind: 'problem', run: state.startedAt, tenant: state.tenant || LEGACY_TENANT,
-          episode: state.problemEpisode.id, problem
-        });
-        state.problemEpisode.sent = true;
-        await save(state);
-      } catch { /* Retry next minute; popup and local notification still show the problem. */ }
+        await relay('/alert', run.token, {kind: 'problem', run: run.startedAt, tenant: run.tenant, episode: run.problemEpisode.id, problem});
+        run.problemEpisode.sent = true;
+        await save();
+      } catch { /* Retry each minute without marking a failed delivery as sent. */ }
     }
+    // Problem alerts handle failed SAP checks; the heartbeat detects a silent worker/Chrome stoppage.
+    await heartbeat(run).catch(() => {});
   }
 }
-
+async function tickAll() {
+  const results = await Promise.allSettled([flushStops(), ...Object.values(state.runs).filter(run => run.running).map(tick)]);
+  for (const result of results) if (result.status === 'rejected') console.error('Tenant check could not finish:', result.reason?.message);
+  await updateControls();
+}
+function publicState() {
+  const runs = Object.values(state.runs).map(({token, seen, ...run}) => ({...run, running: activeRun(run),
+    status: run.running && !activeRun(run) ? 'Nine-hour run finished' : run.status}));
+  return {runs, activeCount: runs.filter(run => activeRun(run)).length};
+}
 chrome.alarms.onAlarm.addListener(alarm => {
-  serialize(() => alarm.name === POLL_ALARM ? tick() : alarm.name === END_ALARM ? stop('Nine-hour run finished') : undefined).catch(console.error);
+  serialize(async () => {
+    if (alarm.name === POLL_ALARM || alarm.name === END_ALARM) return tickAll();
+    if (alarm.name.startsWith(`${END_ALARM}:`)) {
+      const tenant = alarm.name.slice(END_ALARM.length + 1);
+      // A queued alarm from an older run must not end a newly started run for the same tenant.
+      if (state.runs[tenant]?.running && !activeRun(state.runs[tenant])) return stop(tenant, 'Nine-hour run finished');
+    }
+  }).catch(console.error);
 });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || sender.tab) return;
   serialize(async () => {
-    if (message.type === 'status') {
-      const state = await load();
-      const { token, seen, ...publicState } = state;
-      return { ...publicState, configured: Boolean(token) };
-    }
+    if (message.type === 'status') return publicState();
     if (message.type === 'start') return start(message.token, message.sourceTabId);
-    if (message.type === 'stop') return stop();
+    if (message.type === 'stop') return stop(message.tenant);
     if (message.type === 'open') {
-      const state = await load();
-      if (!activeRun(state)) throw new Error('Start monitoring first.');
-      await chrome.tabs.update(state.tabId, {active: true});
+      const run = state.runs[message.tenant];
+      if (!activeRun(run)) throw new Error('Start monitoring this tenant first.');
+      await chrome.tabs.update(run.tabId, {active: true});
       return {status: 'Watchdog tab opened'};
     }
     if (message.type === 'test') {
-      const token = message.token || (await load()).token;
+      const token = message.token || (await chrome.storage.local.get('relayToken')).relayToken;
       await relay('/alert', token, {kind: 'test', nonce: crypto.randomUUID()});
-      await chrome.storage.local.set({ relayToken: token });
-      return { status: 'Test email accepted by Gmail' };
+      await chrome.storage.local.set({relayToken: token});
+      return {status: 'Test email accepted by Gmail'};
     }
     throw new Error('Unknown action');
   }).then(value => respond({ok: true, value}), error => respond({ok: false, error: error.message}));
   return true;
 });
 
-// Recreate missing alarms after a Chrome restart or service-worker suspension.
 serialize(async () => {
-  await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
-  const state = await load();
-  if (!activeRun(state)) { if (state.running) await stop('Nine-hour run finished'); return; }
-  chrome.power.requestKeepAwake('system');
-  if (!(await chrome.alarms.get(POLL_ALARM))) await chrome.alarms.create(POLL_ALARM, {periodInMinutes: 1});
-  if (!(await chrome.alarms.get(END_ALARM))) await chrome.alarms.create(END_ALARM, {when: state.endsAt});
+  await chrome.storage.local.setAccessLevel({accessLevel: 'TRUSTED_CONTEXTS'});
+  state = monitoringState((await chrome.storage.local.get('state')).state);
+  await save();
+  await chrome.alarms.clear(END_ALARM); // Retire the single-run alarm after migration.
+  for (const run of Object.values(state.runs)) {
+    if (activeRun(run)) await chrome.alarms.create(endAlarm(run.tenant), {when: run.endsAt});
+    else if (run.running) await stop(run.tenant, 'Nine-hour run finished');
+  }
+  await updateControls();
 }).catch(console.error);

@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFailedMessages } from '../extension/poll.js';
-import { unseenMessages, activeRun, DURATION, monitorTenant, isTenantOrigin } from '../extension/core.js';
+import { unseenMessages, activeRun, DURATION, monitorTenant, monitorSelection, isTenantOrigin } from '../extension/core.js';
 import { TENANT, TRIAL_TENANT, OTHER_TENANTS } from './fixtures.mjs';
 import { createRelay, composeEmail } from '../relay/server.mjs';
 
@@ -19,6 +19,48 @@ async function withSAP(fetcher, action) {
   finally { globalThis.fetch = previous.fetch; globalThis.location = previous.location; }
 }
 function json(value) { return new Response(JSON.stringify(value), {headers: {'content-type': 'application/json'}}); }
+test('captures selected technical artifact IDs and package from the applied page filters', () => {
+  const filter = {artifactIds: ['flow-a', 'flow-b', 'flow-a'], packageId: 'package-a', status: 'ALL', time: 'PASTDAY'};
+  const selection = monitorSelection(`${TENANT}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(filter))}`);
+  assert.deepEqual(selection, {filter, scope: {artifactIds: ['flow-a', 'flow-b'], packageId: 'package-a'}});
+  for (const filter of [{}, {artifactIds: 'ALL', packageId: 'ALL'}, {artifactIds: []}]) {
+    assert.deepEqual(monitorSelection(`${TENANT}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(filter))}`).scope, {artifactIds: [], packageId: null});
+  }
+  assert.deepEqual(monitorSelection(`${TENANT}/shell/monitoring/Messages/`).scope, {artifactIds: [], packageId: null});
+});
+test('unreadable selected filters fail instead of starting unrestricted monitoring', () => {
+  for (const filter of [null, [], {artifactIds: 'flow-a'}, {artifactIds: [null]}, {packageId: 42}]) {
+    assert.throws(() => monitorSelection(`${TENANT}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(filter))}`));
+  }
+  assert.throws(() => monitorSelection(`${TENANT}/shell/monitoring/Messages/%7B`), /Cannot read/);
+});
+test('uses exact artifact IDs with escaped OData literals and excludes other flows on every page', async () => {
+  const scope = {artifactIds: ["flow'a", 'flow-b'], packageId: "package'a"};
+  const scoped = (id, artifact, pkg = scope.packageId) => ({...item(id), IntegrationArtifact: {Id: artifact, PackageId: pkg, Name: 'Identical display name'}});
+  let pages = 0;
+  const records = await withSAP(async url => {
+    if (++pages === 1) {
+      assert.match(new URL(url).searchParams.get('$filter'), /and \(IntegrationArtifact\/Id eq 'flow''a' or IntegrationArtifact\/Id eq 'flow-b'\) and IntegrationArtifact\/PackageId eq 'package''a'$/);
+      return json({d: {results: [scoped('selected-a', "flow'a"), scoped('unselected', 'flow-c')], __next: '/api/v1/MessageProcessingLogs?$skiptoken=two'}});
+    }
+    return json({d: {results: [scoped('selected-b', 'flow-b'), scoped('wrong-package', 'flow-b', 'other'), scoped('unselected-page-two', 'flow-c')]}});
+  }, () => readFailedMessages(Date.now(), TENANT, scope));
+  assert.deepEqual(records.map(record => record.id), ['selected-a', 'selected-b']);
+  assert.equal(pages, 2);
+});
+test('package-only monitoring restricts results and missing scope metadata fails the check', async () => {
+  const scoped = (id, pkg) => ({...item(id), IntegrationArtifact: {Id: 'flow-a', PackageId: pkg}});
+  const records = await withSAP(async url => {
+    const filter = new URL(url).searchParams.get('$filter');
+    assert.match(filter, /IntegrationArtifact\/PackageId eq 'package-a'/);
+    assert.doesNotMatch(filter, /IntegrationArtifact\/Id/);
+    return json({d: {results: [scoped('in-package', 'package-a'), scoped('out-of-package', 'package-b')]}});
+  }, () => readFailedMessages(Date.now(), TENANT, {packageId: 'package-a'}));
+  assert.deepEqual(records.map(record => record.id), ['in-package']);
+  for (const scope of [{artifactIds: ['flow-a']}, {packageId: 'package-a'}]) {
+    await assert.rejects(withSAP(async () => json({d: {results: [item('missing-metadata')]}}), () => readFailedMessages(Date.now(), TENANT, scope)), /without its (artifact|package) ID/);
+  }
+});
 test('reads authenticated FAILED messages and follows browser-route pagination', async () => {
   const urls = [];
   const records = await withSAP(async (url, options) => {
@@ -133,7 +175,7 @@ test('retries SMTP errors and suppresses duplicate/regrouped sends including per
   }});
 });
 test('test and monitoring-problem emails do not pretend a check succeeded', () => {
-  assert.match(composeEmail({kind: 'problem', problem: 'Session expired'}).text, /cannot currently confirm/);
+  assert.match(composeEmail({kind: 'problem', tenant: TENANT, problem: 'Session expired'}).text, /cannot currently confirm/);
   assert.match(composeEmail({kind: 'test'}).subject, /test email/);
 });
 test('trial-tenant alerts are accepted, links match the tenant, and receipts are isolated by tenant', async () => {

@@ -6,7 +6,7 @@
 <input id="token" type="password" placeholder="From npm run setup" autocomplete="off">
 <div class="actions"><button id="start">Start this tenant</button><button id="test" class="secondary">Send test email</button></div>
 <button id="report" class="secondary">Email 24-hour report</button>
-<p class="hint">Reports cover all iFlows with logs started in the last 24 hours on the open tenant, regardless of page filters. Emails include Completed, Retry and Failed counts plus a CSV attachment.</p>
+<p class="hint">Reports cover the applied artifact and package filters on the open tenant over the last 24 hours. Every selected iFlow is included, even with zero messages. Emails include Completed, Retry and Failed counts plus a CSV attachment.</p>
 <p id="status" role="status" aria-live="polite">Loading…</p>
 <div id="runs" aria-label="Tenant monitoring runs"></div>
 <p class="hint">Open each tenant's Monitor Message Processing page and click Start. Keep Chrome and the relay running. Missing heartbeats trigger an email after three minutes.</p>

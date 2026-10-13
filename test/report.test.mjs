@@ -18,9 +18,9 @@ const record = (id, status = 'COMPLETED', flow = 'flow-a', time = from) => ({Mes
 const payload = () => ({tenant: TENANT, from, to, nonce: 'report-request-1', flows: [
   {id: 'flow-a', name: 'Flow A', completed: 2, retry: 1, failed: 3}
 ]});
-function readerResult(fetcher, origin = TENANT, clock = Date) {
+function readerResult(fetcher, origin = TENANT, clock = Date, scope = {}) {
   return runInNewContext(`(${readMessageReport.toString()})(...args)`, {
-    args: [from, to, TENANT], location: new URL(`${origin}/shell/monitoring/Messages/`), URL, Date: clock, AbortSignal, fetch: fetcher
+    args: [from, to, TENANT, scope], location: new URL(`${origin}/shell/monitoring/Messages/`), URL, Date: clock, AbortSignal, fetch: fetcher
   });
 }
 async function reader(...args) {
@@ -54,6 +54,71 @@ test('serialized report counts all statuses by technical ID, deduplicates pages,
   assert.equal(urls[0].searchParams.has('$select'), false);
   assert.equal(filter, `LogStart ge datetime'${new Date(from).toISOString().slice(0, 19)}' and LogStart lt datetime'${new Date(to).toISOString().slice(0, 19)}'`);
   assert.doesNotMatch(filter, /Status|IntegrationArtifact|LogEnd/);
+});
+
+test('report reads every 50-record offset without continuation links, including more than ten selected flows and zero-log flows', async () => {
+  const artifactIds = Array.from({length: 26}, (_, index) => `flow-${index}`);
+  const records = Array.from({length: 150}, (_, index) => record(`message-${index}`, ['COMPLETED', 'RETRY', 'FAILED'][index % 3], `flow-${index % 25}`));
+  const offsets = [];
+  const rows = await reader(async url => {
+    const offset = Number(new URL(url).searchParams.get('$skip') || 0);
+    offsets.push(offset);
+    return Response.json({d: {results: records.slice(offset, offset + 50)}});
+  }, TENANT, Date, {artifactIds});
+  assert.deepEqual(offsets, [0, 50, 100, 150]);
+  assert.equal(rows.length, 26);
+  assert.deepEqual(JSON.parse(JSON.stringify(rows.find(row => row.id === 'flow-25'))), {id: 'flow-25', name: 'flow-25', completed: 0, retry: 0, failed: 0});
+  for (const field of ['completed', 'retry', 'failed']) assert.equal(rows.reduce((sum, row) => sum + row[field], 0), 50);
+});
+
+test('report preserves escaped artifact/package filters on every page and excludes unrelated rows', async () => {
+  const scope = {artifactIds: ["flow'a", 'flow-b', 'flow-empty', "flow'a"], packageId: "package'one"};
+  const inPackage = item => ({...item, IntegrationArtifact: {...item.IntegrationArtifact, PackageId: scope.packageId}});
+  const urls = [];
+  const rows = await reader(async url => {
+    urls.push(new URL(url));
+    return Response.json({d: {results: urls.length === 1
+      ? Array.from({length: 50}, (_, index) => inPackage(record(`a-${index}`, 'RETRY', "flow'a")))
+      : [inPackage(record('b', 'FAILED', 'flow-b')), inPackage(record('outside', 'COMPLETED', 'outside')),
+        {...record('wrong-package', 'FAILED', 'flow-b'), IntegrationArtifact: {Id: 'flow-b', PackageId: 'other'}}]}});
+  }, TENANT, Date, scope);
+  assert.equal(urls.length, 2);
+  assert.equal(urls[0].searchParams.get('$filter'), urls[1].searchParams.get('$filter'));
+  assert.match(urls[0].searchParams.get('$filter'), /IntegrationArtifact\/Id eq 'flow''a'/);
+  assert.match(urls[0].searchParams.get('$filter'), /IntegrationArtifact\/PackageId eq 'package''one'/);
+  assert.doesNotMatch(urls[0].searchParams.get('$filter'), /Status|LogEnd/);
+  assert.equal(rows.length, 3);
+  assert.equal(rows.find(row => row.id === "flow'a").retry, 50);
+  assert.equal(rows.find(row => row.id === 'flow-b').failed, 1);
+  assert.equal(rows.find(row => row.id === 'flow-empty').completed, 0);
+  await assert.rejects(reader(async () => Response.json({d: {results: [record('missing-package')]}}), TENANT, Date, {packageId: 'one'}), /without its package ID/);
+  const packageRows = await reader(async () => Response.json({d: {results: [inPackage(record('one')), {...record('two'), IntegrationArtifact: {Id: 'flow-b', PackageId: 'other'}}]}}), TENANT, Date, {packageId: scope.packageId});
+  assert.equal(packageRows.length, 1);
+});
+
+test('report continues after a 50-record chunk split across smaller server-driven pages', async () => {
+  const records = Array.from({length: 63}, (_, index) => record(`message-${index}`, 'COMPLETED', `flow-${index}`));
+  const offsets = [];
+  const rows = await reader(async url => {
+    const params = new URL(url).searchParams;
+    const offset = Number(params.get('$skiptoken') || params.get('$skip') || 0);
+    offsets.push(offset);
+    const end = Math.min(offset + 10, Math.floor(offset / 50) * 50 + 50, records.length);
+    return Response.json({d: {results: records.slice(offset, end),
+      ...(end < records.length && end % 50 !== 0 ? {__next: `/api/v1/MessageProcessingLogs?$skiptoken=${end}`} : {})}});
+  });
+  assert.deepEqual(offsets, [0, 10, 20, 30, 40, 50, 60]);
+  assert.equal(rows.length, 63);
+  assert.equal(rows.reduce((sum, row) => sum + row.completed, 0), 63);
+});
+
+test('offset pagination fails without a partial report when SAP ignores skip or a later page fails', async () => {
+  const records = Array.from({length: 50}, (_, index) => record(`message-${index}`));
+  let calls = 0;
+  await assert.rejects(reader(async () => {calls++; return Response.json({d: {results: records}});}), /made no progress; no partial report/);
+  assert.equal(calls, 2);
+  calls = 0;
+  await assert.rejects(reader(async () => ++calls === 1 ? Response.json({d: {results: records}}) : new Response('', {status: 500})), /HTTP 500/);
 });
 
 test('report fails rather than emailing incomplete or untrusted SAP results', async () => {
@@ -144,6 +209,12 @@ test('report contract rejects malformed windows, duplicate rows, negative/unsafe
   assert.throws(() => validateReport({...payload(), flows: [
     {...payload().flows[0], completed: Number.MAX_SAFE_INTEGER}, {...payload().flows[0], id: 'flow-b'}
   ]}));
+  const selected = {...payload(), scope: {artifactIds: ['flow-a'], packageId: null}};
+  assert.equal(validateReport(selected), selected);
+  for (const scope of [null, {artifactIds: 'flow-a'}, {artifactIds: ['flow-b']}, {artifactIds: ['flow-a', 'flow-b']},
+    {artifactIds: ['flow-a', 'flow-a']}, {artifactIds: ['flow-a'], packageId: 42}]) {
+    assert.throws(() => validateReport({...payload(), scope}));
+  }
 });
 
 test('email includes clear UTC scope, totals, HTML escaping and a safe CSV attachment, including empty reports', () => {
@@ -159,12 +230,16 @@ test('email includes clear UTC scope, totals, HTML escaping and a safe CSV attac
   const empty = composeReport({...report, flows: []});
   assert.match(empty.text, /No message processing logs found/);
   assert.match(empty.text, /Completed: 0, Retry: 0, Failed: 0/);
+  const selected = composeReport({...report, scope: {artifactIds: ['flow-a'], packageId: '<script>package</script>'}});
+  assert.match(selected.text, /1 selected iFlows, including those with no logs/);
+  assert.match(selected.html, /Restricted to package: &lt;script&gt;package&lt;\/script&gt;/);
+  assert.doesNotMatch(selected.html, /<script>/);
 });
 
 test('report succeeds without a monitoring run and does not create tabs, alarms, heartbeats or table refreshes', async () => {
   const h = await backgroundHarness();
   try {
-    h.tabs.get(1).url += encodeURIComponent(JSON.stringify({artifactIds: ['excluded'], packageId: 'excluded', status: 'FAILED'}));
+    h.tabs.get(1).url += encodeURIComponent(JSON.stringify({artifactIds: ['flow-a', 'empty-flow'], status: 'FAILED', time: 'PASTHOUR'}));
     h.sap.set(TENANT, [record('one', 'RETRY', 'flow-a', h.time - 1000)]);
     const before = structuredClone(h.store.state);
     const result = await h.request('report', null, {sourceTabId: 1});
@@ -176,7 +251,9 @@ test('report succeeds without a monitoring run and does not create tabs, alarms,
     assert.equal(h.monitoring.length, 0);
     assert.equal(h.tableClicks.length, 0);
     assert.equal(h.delivered.length, 1);
-    assert.equal(h.delivered[0].flows[0].retry, 1);
+    assert.equal(h.delivered[0].flows.find(flow => flow.id === 'flow-a').retry, 1);
+    assert.equal(h.delivered[0].flows.length, 2);
+    assert.deepEqual(h.delivered[0].scope, {artifactIds: ['flow-a', 'empty-flow'], packageId: null});
     assert.equal(h.delivered[0].to - h.delivered[0].from, 86400000);
     h.denied.add(TENANT);
     assert.equal((await h.request('report', null, {sourceTabId: 1})).ok, false);
@@ -245,11 +322,32 @@ test('serialized extension report → authenticated HTTP relay → fixed mail re
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
     h = await backgroundHarness({relayFetch: (url, options) => nativeFetch(`${base}${new URL(url).pathname}`, options)});
-    h.sap.set(TENANT, [record('completed', 'COMPLETED', 'flow-a', h.time - 1000), record('retry', 'RETRY', 'flow-b', h.time - 1000)]);
+    const artifactIds = Array.from({length: 31}, (_, index) => `flow-${index}`);
+    h.tabs.get(1).url += encodeURIComponent(JSON.stringify({artifactIds, packageId: 'selected-package', status: 'FAILED'}));
+    const records = Array.from({length: 137}, (_, index) => ({...record(`message-${index}`, index % 2 ? 'RETRY' : 'COMPLETED', `flow-${index % 30}`, h.time - 1000),
+      IntegrationArtifact: {Id: `flow-${index % 30}`, PackageId: 'selected-package', Name: 'Same display name'}}));
+    records.push({...record('excluded', 'FAILED', 'excluded-flow', h.time - 1000), IntegrationArtifact: {Id: 'excluded-flow', PackageId: 'selected-package'}});
+    h.sap.set(TENANT, url => {
+      const offset = Number(new URL(url).searchParams.get('$skip') || 0);
+      return Response.json({d: {results: records.slice(offset, offset + 50)}});
+    });
     assert.equal((await h.request('report', null, {sourceTabId: 1})).ok, true);
     assert.equal(mails[0].to, 'recipient@gmail.com');
-    assert.match(mails[0].text, /Completed: 1, Retry: 1, Failed: 0/);
-    assert.ok(mails[0].attachments[0].content.includes('flow-b'));
+    assert.match(mails[0].text, /Completed: 69, Retry: 68, Failed: 0/);
+    assert.match(mails[0].text, /31 selected iFlows/);
+    assert.equal(mails[0].attachments[0].content.split('\r\n').length, 32);
+    assert.match(mails[0].attachments[0].content, /"flow-30","flow-30",0,0,0/);
+    assert.doesNotMatch(mails[0].text, /excluded-flow/);
+    h.sap.set(TENANT, url => new URL(url).searchParams.has('$skip')
+      ? new Response('', {status: 500}) : Response.json({d: {results: records.slice(0, 50)}}));
+    assert.equal((await h.request('report', null, {sourceTabId: 1})).ok, false);
+    assert.equal(mails.length, 1); // A later-page failure must never send a partial report.
+    const readsBeforeInvalidFilter = h.reads.length;
+    h.tabs.get(1).url = `${TENANT}/shell/monitoring/Messages/%broken`;
+    const invalidFilter = await h.request('report', null, {sourceTabId: 1});
+    assert.match(invalidFilter.error, /Apply the filters with Go/);
+    assert.equal(h.reads.length, readsBeforeInvalidFilter);
+    assert.equal(mails.length, 1);
     const request = (body, auth = token) => nativeFetch(`${base}/report`, {method: 'POST', headers: {Authorization: `Bearer ${auth}`, 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
     assert.equal((await request(payload(), 'wrong')).status, 401);
     assert.equal((await request({...payload(), to: 0})).status, 400);

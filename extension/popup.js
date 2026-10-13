@@ -34,7 +34,8 @@ async function render(notice = '') {
     heading.textContent = new URL(run.tenant).hostname;
     const detail = document.createElement('p');
     detail.textContent = `${run.status}\nEnds: ${new Date(run.endsAt).toLocaleTimeString()}\nFailed messages emailed: ${run.sent}`;
-    detail.textContent += `\nArtifacts: ${run.scope?.artifactIds?.length ? run.scope.artifactIds.join(', ') : 'All'}`;
+    const count = new Set(run.scope?.artifactIds || []).size;
+    detail.textContent += `\nMonitoring: ${count ? `${count} iFlow${count === 1 ? '' : 's'}` : run.scope?.packageId ? 'All iFlows in the selected package' : 'All iFlows'}`;
     if (run.scope?.packageId) detail.textContent += `\nPackage: ${run.scope.packageId}`;
     if (run.lastCheck) detail.textContent += `\nLast check: ${new Date(run.lastCheck).toLocaleTimeString()}`;
     if (run.lastRefresh) detail.textContent += `\nLast table refresh: ${new Date(run.lastRefresh).toLocaleTimeString()}`;

@@ -57,6 +57,7 @@ async function report(token, sourceTabId) {
   const source = await chrome.tabs.get(sourceTabId);
   const tenant = monitorTenant(source.url);
   if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
+  const {scope} = monitorSelection(source.url);
   if (reports.has(tenant)) throw new Error('A report for this tenant is already being generated.');
   reports.add(tenant);
   try {
@@ -66,11 +67,11 @@ async function report(token, sourceTabId) {
     if (health.reports !== true) throw new Error('This relay does not support reports. Update and restart the relay on this device first.');
     const to = Math.floor(Date.now() / 1000) * 1000;
     const from = to - 86400000;
-    const result = await chrome.scripting.executeScript({target: {tabId: sourceTabId}, world: 'MAIN', func: readMessageReport, args: [from, to, tenant]});
+    const result = await chrome.scripting.executeScript({target: {tabId: sourceTabId}, world: 'MAIN', func: readMessageReport, args: [from, to, tenant, scope]});
     const read = result?.find(frame => frame.frameId === 0)?.result ?? result?.[0]?.result;
     if (read?.ok === false && typeof read.error === 'string') throw new Error(read.error);
     if (read?.ok !== true || !Array.isArray(read.flows)) throw new Error('SAP report reader did not return data. Reload the extension and the tenant page, then try again; no report was emailed.');
-    const payload = validateReport({tenant, from, to, nonce: crypto.randomUUID(), flows: read.flows});
+    const payload = validateReport({tenant, from, to, scope, nonce: crypto.randomUUID(), flows: read.flows});
     await relay('/report', token, payload);
     await chrome.storage.local.set({relayToken: token});
     return {status: `24-hour report accepted by Gmail for ${new URL(tenant).hostname} (${payload.flows.length} iFlows).`};

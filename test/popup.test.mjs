@@ -49,7 +49,16 @@ test('popup adds a second tenant with scoped permission and targets independent 
   assert.equal(elements.runs.children.length, 2);
   const firstCard = elements.runs.children[0];
   assert.equal(firstCard.children[0].textContent, new URL(TRIAL_TENANT).hostname);
-  assert.match(firstCard.children[1].textContent, /Artifacts: flow-a, flow-b\nPackage: package-a/);
+  assert.match(firstCard.children[1].textContent, /Monitoring: 2 iFlows\nPackage: package-a/);
+  assert.doesNotMatch(firstCard.children[1].textContent, /flow-a|flow-b/);
+  assert.match(elements.runs.children[1].children[1].textContent, /Monitoring: All iFlows/);
+  initial.scope = {artifactIds: ['only-flow', 'only-flow'], packageId: null};
+  await elements.test.click();
+  assert.match(elements.runs.children[0].children[1].textContent, /Monitoring: 1 iFlow$/);
+  assert.doesNotMatch(elements.runs.children[0].children[1].textContent, /only-flow/);
+  initial.scope = {artifactIds: [], packageId: 'package-a'};
+  await elements.test.click();
+  assert.match(elements.runs.children[0].children[1].textContent, /Monitoring: All iFlows in the selected package/);
   const open = flatten(firstCard).find(node => node.textContent === 'Open watchdog tab');
   calls.length = 0; await open.click();
   assert.equal(calls[0].message.tenant, TRIAL_TENANT);

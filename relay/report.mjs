@@ -2,7 +2,10 @@ export function composeReport(report) {
   const totals = report.flows.reduce((sum, flow) => ({completed: sum.completed + flow.completed, retry: sum.retry + flow.retry, failed: sum.failed + flow.failed}),
     {completed: 0, retry: 0, failed: 0});
   const window = `${new Date(report.from).toISOString()} (inclusive) to ${new Date(report.to).toISOString()} (exclusive)`;
-  const scope = 'All iFlows with message processing logs starting in this UTC window. Counts use current MPL status; Retry counts messages, not individual retry attempts. iFlows without logs in the window are omitted. Other statuses are excluded from the three counts.';
+  const selection = report.scope?.artifactIds?.length
+    ? `${report.scope.artifactIds.length} selected iFlows, including those with no logs in this window.`
+    : 'All iFlows with message processing logs starting in this UTC window.';
+  const scope = `${selection}${report.scope?.packageId ? ` Restricted to package: ${report.scope.packageId}.` : ''} Counts use current MPL status; Retry counts messages, not individual retry attempts. Other statuses are excluded from the three counts.`;
   const singleLine = value => value.replace(/[\r\n\t]/g, ' ');
   const text = [
     `Tenant: ${report.tenant}`, `Last 24 hours: ${window}`, scope,
@@ -11,7 +14,7 @@ export function composeReport(report) {
   ].join('\n\n');
   const escape = value => String(value).replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char]));
   const row = flow => `<tr><td>${escape(flow.name)}</td><td>${escape(flow.id)}</td><td>${flow.completed}</td><td>${flow.retry}</td><td>${flow.failed}</td></tr>`;
-  const html = `<h1>IS message report — last 24 hours</h1><p>Tenant: ${escape(report.tenant)}</p><p>${escape(window)}</p><p>${scope}</p>` +
+  const html = `<h1>IS message report — last 24 hours</h1><p>Tenant: ${escape(report.tenant)}</p><p>${escape(window)}</p><p>${escape(scope)}</p>` +
     (report.flows.length ? `<table border="1" cellpadding="6" cellspacing="0"><thead><tr><th>iFlow</th><th>Technical ID</th><th>Completed</th><th>Retry</th><th>Failed</th></tr></thead><tbody>${report.flows.map(row).join('')}</tbody><tfoot>${row({name: 'Totals', id: '', ...totals})}</tfoot></table>` : '<p>No message processing logs found in this window.</p>');
   // Quote CSV cells and neutralize spreadsheet formulas from tenant-controlled names/IDs.
   const csvCell = value => `"${(/^[\s]*[=+\-@]/.test(value) ? "'" : '') + singleLine(value).replace(/"/g, '""')}"`;

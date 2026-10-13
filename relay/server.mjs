@@ -5,6 +5,8 @@ import { pathToFileURL } from 'node:url';
 import nodemailer from 'nodemailer';
 import { LEGACY_TENANT, isTenantOrigin } from '../extension/core.js';
 import {createMonitoringWatch, validateMonitor} from './monitor.mjs';
+import {validateReport} from '../extension/report-contract.js';
+import {composeReport} from './report.mjs';
 
 const EMAIL = /^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/;
 export function validateAlert(value) {
@@ -29,7 +31,7 @@ export function validateAlert(value) {
 }
 export function alertKey(alert) {
   // Per-message receipts are also stored, so regrouped retries do not re-email sent IDs.
-  const identity = alert.kind === 'test' ? alert.nonce : ['problem', 'stopped'].includes(alert.kind) ? [alert.run, alert.episode] : alert.messages.map(message => message.id).sort();
+  const identity = ['test', 'report'].includes(alert.kind) ? alert.nonce : ['problem', 'stopped'].includes(alert.kind) ? [alert.run, alert.episode] : alert.messages.map(message => message.id).sort();
   return createHash('sha256').update(JSON.stringify([alert.kind, alert.tenant, identity])).digest('hex');
 }
 export function composeEmail(alert) {
@@ -47,13 +49,15 @@ export function composeEmail(alert) {
     text: alert.messages.map(message => `Status: FAILED\nFlow: ${message.flow}\nMessage ID: ${message.id}\nTime: ${message.time || 'Unavailable'}\nOpen: ${message.url}`).join('\n\n')
   };
 }
-async function jsonBody(request) {
-  let body = '';
+async function jsonBody(request, limit = 100000) {
+  const chunks = [];
+  let size = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (Buffer.byteLength(body) > 100000) throw new Error('Request too large');
+    size += chunk.length;
+    if (size > limit) throw new Error('Request too large');
+    chunks.push(chunk);
   }
-  return JSON.parse(body);
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 export async function createRelay({token, user, recipient, transport, stateFile = '.relay-state.json', monitorFile = `${stateFile}.monitoring`, now = Date.now}) {
   if (!token || token.length < 32 || !EMAIL.test(user || '') || !EMAIL.test(recipient || '')) throw new Error('Run npm run setup first.');
@@ -75,7 +79,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
       !receipts[`message:${alert.tenant}:${message.id}`] && !(alert.tenant === LEGACY_TENANT && receipts[`message:${message.id}`])
     )} : alert;
     if (filtered.kind === 'failures' && !filtered.messages.length) return {ok: true, duplicate: true};
-    const mail = composeEmail(filtered);
+    const mail = filtered.kind === 'report' ? composeReport(filtered) : composeEmail(filtered);
     const info = await transport.sendMail({from: user, to: recipient, ...mail});
     if (!info.accepted?.length || info.rejected?.length) throw new Error('Gmail did not accept the recipient');
     receipts[key] = Date.now();
@@ -101,10 +105,13 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     const supplied = Buffer.from(request.headers.authorization || '');
     const expected = Buffer.from(`Bearer ${token}`);
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return reply(401, {error: 'Invalid relay key'});
-    if (request.method === 'GET' && request.url === '/health') return reply(200, {ok: true});
-    if (request.method !== 'POST' || !['/alert', '/monitor'].includes(request.url)) return reply(404, {error: 'Not found'});
+    if (request.method === 'GET' && request.url === '/health') return reply(200, {ok: true, reports: true});
+    if (request.method !== 'POST' || !['/alert', '/monitor', '/report'].includes(request.url)) return reply(404, {error: 'Not found'});
     let alert;
-    try { alert = (request.url === '/monitor' ? validateMonitor : validateAlert)(await jsonBody(request)); }
+    try {
+      const body = await jsonBody(request, request.url === '/report' ? 2000000 : 100000);
+      alert = request.url === '/report' ? {...validateReport(body), kind: 'report'} : (request.url === '/monitor' ? validateMonitor : validateAlert)(body);
+    }
     catch { return reply(400, {error: 'Invalid alert request'}); }
     const result = serialize(() => request.url === '/monitor' ? monitor.receive(alert) : deliver(alert));
     try { return reply(200, await result); }

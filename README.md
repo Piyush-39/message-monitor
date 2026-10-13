@@ -44,6 +44,22 @@ Existing failures are recorded as a baseline and do not trigger emails. New fail
 
 The popup shows each tenant's status, last successful SAP check, table-refresh time, sent-message count and end time. Email subjects identify the tenant. **Stop** ends the selected tenant's run; the run also stops automatically after nine hours. The dedicated tab stays open. Starting another run creates a fresh tab; old watchdog tabs can be closed after stopping. A check has a 20-second / 200-page budget; unusually high failure volume is reported as a monitoring problem rather than silently truncated.
 
+## Email a 24-hour iFlow report
+
+Open the tenant's **Monitor Message Processing** page in the Chrome profile where you are signed in, open the extension popup, and click **Email 24-hour report**. Allow access to that tenant if Chrome asks. The local email relay must be running with a valid relay key. Starting a watchdog run is not required.
+
+The email contains a table and CSV attachment with **Completed**, **Retry**, and **Failed** message counts for each technical iFlow ID, plus totals. It covers all iFlows with message processing logs in the tenant during the window, regardless of the page's artifact, package, status or time filters. Identical display names remain separate by technical ID. Flows with only other statuses appear with zero counts; flows with no logs in the window are omitted. An empty window produces an explicit empty report.
+
+The fixed window is the last 24 hours at the time the read starts, rounded to whole seconds, based on `LogStart`: the start is inclusive and the end exclusive. Both timestamps are shown in UTC. The report counts each unique message's **current MPL status** when read, rather than historical status transitions or individual retry attempts. Using `LogStart` includes Retry messages without a completed `LogEnd`. Statuses can change while paginated reads are in progress; SAP does not provide a transactional snapshot through this reader. Logs already removed by tenant retention cannot be counted.
+
+The report makes authenticated GET requests only. It does not change tenant configuration, message processing, page filters, refresh the message table, or start/stop monitoring. Reads run outside the monitoring queue so polls and Stop remain available. It follows same-tenant pagination, deduplicates message IDs, and fails without emailing partial results if a page fails or the 60-second / 200-page / 1,000-iFlow budget is exceeded. Gmail acceptance is reported in the popup; delivery failures appear there and can be retried.
+
+### Upgrade the reporting device without changing another device
+
+Version 1.2.0 requires the updated relay for reports; the popup tells you if its relay is too old before reading SAP. Upgrade the relay and reload the extension **on the device that will generate reports**. Existing alert and heartbeat endpoints remain compatible with older extension versions. Each device has its own Chrome storage, local relay, `.env`, and delivery receipts; updating a checkout or opening a PR does not update installations on another device. Do not reload the extension, restart the relay, or replace files on the other monitoring device during development. The report uses the signed-in session on the device where its button is clicked; it cannot access a Chrome session on another device.
+
+For the **1.2.1 report-reader fix**, reload the existing extension after updating its files. The report now uses the monitor's 50-record browser-session query without a field projection or composite sort and accepts OData and ISO UTC/offset start times. Page-reader failures return a structured result to the extension, so the popup displays the SAP HTTP error, sign-in requirement, invalid response or timeout instead of the generic “SAP report failed” message. An already-running 1.2.0 relay does not need to be restarted for this fix.
+
 ## Session and laptop behavior
 
 Each check sends an actual authenticated SAP read request. For an inactivity timeout, these requests are intended to keep the session active. This was verified as an authenticated HTTP 200 read on your tenant; continuous operation beyond 15 minutes and a full nine-hour shift still need live validation. Tenant or identity-provider policies can still require reauthentication.
@@ -77,6 +93,8 @@ npm test
 ```
 
 Automated tests cover simultaneous tenants with matching message IDs, selected artifact/package baselines and polls, exact IDs despite identical display names, OData escaping, pagination filtering, malformed filters, independent Stop/expiry, slow or failed tenants, permission denial/revocation, worker restart and legacy state migration, missing table refresh, and persisted delivery receipts. An end-to-end test runs the actual serialized page reader against fake SAP responses, sends requests through the real authenticated HTTP relay, and checks mail delivery with a fake SMTP transport, including exclusion of unselected iFlows. Tests do not create SAP messages or send real Gmail email.
+
+Report tests additionally cover the 24-hour start-time boundaries, Retry without `LogEnd`, duplicate IDs across pages, flows with identical names, zero/empty counts, failed or oversized pagination, malformed report rows, HTML/CSV escaping, email retries and request receipts, older relay detection, and reporting without a watchdog run. A slow-report test verifies that other tenants keep polling and can Stop; popup tests verify Stop stays enabled during report generation. The report's serialized reader and real authenticated HTTP relay are exercised together using fake SAP and SMTP responses. Version 1.2.0 has not been tested against the live tenant or real Gmail to avoid disturbing monitoring on another device.
 
 Earlier versions were validated live on the trial tenant, including successful failure emails and automatic SAP table refresh. Version 1.1.1's artifact and package query was also checked read-only against an authenticated tenant: HTTP 200 with a result matching both selected IDs. Filtered email delivery, concurrent tenant and outage behavior are covered by automated tests; simultaneous live tenant sessions and a full nine-hour shift still need live validation.
 

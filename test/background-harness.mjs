@@ -46,7 +46,8 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
           reads.push({tenant, url: String(url), options});
           if (broken.has(tenant)) return new Response('Login', {headers: {'content-type': 'text/html'}});
           const records = sap.get(tenant);
-          return Response.json({d: {results: typeof records === 'function' ? await records() : records || []}});
+          const value = typeof records === 'function' ? await records(url, options) : records || [];
+          return value instanceof Response ? value : Response.json({d: {results: value}});
         },
         document: {querySelector() {return refreshAvailable ? {querySelectorAll() {return [{id: 'refresh',
           querySelector() {return {getAttribute() {return '\ue010';}};}, getAttribute() {return null;}, getClientRects() {return [{}];}
@@ -56,7 +57,13 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
           getEnabled() {return true;}, hasListeners() {return true;}, firePress() {tableClicks.push(tenant);}
         };}};}}}
       };
-      return [{result: await runInNewContext(`(${func.toString()})(...args)`, context)}];
+      try {
+        return [{frameId: 0, result: structuredClone(await runInNewContext(`(${func.toString()})(...args)`, context))}];
+      } catch {
+        // Chrome resolves with no result for a page-script exception, rather than
+        // rejecting executeScript with that exception as the old harness did.
+        return [{frameId: 0}];
+      }
     }},
     alarms: {
       async create(name, options) {alarms.set(name, options);}, async get(name) {return alarms.get(name);},
@@ -79,7 +86,7 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
       if (emailBroken) return Response.json({error: 'Email unavailable'}, {status: 502});
       delivered.push(body);
     }
-    return relayFetch ? relayFetch(url, options) : Response.json({ok: true});
+    return relayFetch ? relayFetch(url, options) : Response.json({ok: true, reports: true});
   };
   function request(type, tenant, extra = {}) {
     return new Promise(resolve => onMessage({type, token, ...(tenant ? {tenant} : {}), ...extra}, {id: chrome.runtime.id}, resolve));

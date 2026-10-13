@@ -1,13 +1,10 @@
 import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, DURATION, POLL_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
 import { readFailedMessages, refreshMessageTable } from './poll.js';
-import {readMessageReport} from './report.js';
-import {validateReport} from './report-contract.js';
 
 const RELAY = 'http://127.0.0.1:43171';
 let state;
 let queue = Promise.resolve();
 let writes = Promise.resolve();
-const reports = new Set();
 function serialize(operation) {
   const result = queue.then(operation);
   queue = result.catch(() => {});
@@ -51,31 +48,6 @@ async function read(run, since) {
   const result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readFailedMessages, args: [since, tenant, run.scope || {}]});
   if (!Array.isArray(result[0]?.result)) throw new Error(result[0]?.error?.message || 'SAP check failed. Sign in again if the tab shows a login page.');
   return result[0].result;
-}
-async function report(token, sourceTabId) {
-  if (!Number.isInteger(sourceTabId)) throw new Error('Open your IS Monitor Message Processing page first.');
-  const source = await chrome.tabs.get(sourceTabId);
-  const tenant = monitorTenant(source.url);
-  if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
-  const {scope} = monitorSelection(source.url);
-  if (reports.has(tenant)) throw new Error('A report for this tenant is already being generated.');
-  reports.add(tenant);
-  try {
-    if (!(await chrome.permissions.contains({origins: [`${tenant}/*`]}))) throw new Error('Tenant access missing. Click Email 24-hour report again and allow access.');
-    token ||= (await chrome.storage.local.get('relayToken')).relayToken;
-    const health = await relay('/health', token);
-    if (health.reports !== true) throw new Error('This relay does not support reports. Update and restart the relay on this device first.');
-    const to = Math.floor(Date.now() / 1000) * 1000;
-    const from = to - 86400000;
-    const result = await chrome.scripting.executeScript({target: {tabId: sourceTabId}, world: 'MAIN', func: readMessageReport, args: [from, to, tenant, scope]});
-    const read = result?.find(frame => frame.frameId === 0)?.result ?? result?.[0]?.result;
-    if (read?.ok === false && typeof read.error === 'string') throw new Error(read.error);
-    if (read?.ok !== true || !Array.isArray(read.flows)) throw new Error('SAP report reader did not return data. Reload the extension and the tenant page, then try again; no report was emailed.');
-    const payload = validateReport({tenant, from, to, scope, nonce: crypto.randomUUID(), flows: read.flows});
-    await relay('/report', token, payload);
-    await chrome.storage.local.set({relayToken: token});
-    return {status: `24-hour report accepted by Gmail for ${new URL(tenant).hostname} (${payload.flows.length} iFlows).`};
-  } finally {reports.delete(tenant);}
 }
 async function updateControls() {
   const active = Object.values(state.runs).filter(run => activeRun(run));
@@ -206,12 +178,6 @@ chrome.alarms.onAlarm.addListener(alarm => {
 });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || sender.tab) return;
-  if (message.type === 'report') {
-    // Wait for initialization, then read independently: a large report must not delay polls or Stop.
-    queue.then(() => report(message.token, message.sourceTabId))
-      .then(value => respond({ok: true, value}), error => respond({ok: false, error: error.message}));
-    return true;
-  }
   serialize(async () => {
     if (message.type === 'status') return publicState();
     if (message.type === 'start') return start(message.token, message.sourceTabId);

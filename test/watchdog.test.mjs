@@ -134,8 +134,14 @@ function failure(ids = ['a']) {
     messages: ids.map(id => ({id, flow: 'Test flow', time: '2026-10-10T08:00:00.000Z', url: `${TENANT}/shell/monitoring/Messages/${id}`}))};
 }
 test('local relay authenticates requests and fixes the recipient', async () => {
-  await relayFixture(async ({request, sent}) => {
-    assert.equal((await request(null)).status, 200);
+  await relayFixture(async ({request, sent, base, config}) => {
+    const health = await request(null);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), {ok: true});
+    assert.equal((await fetch(`${base}/report`, {
+      method: 'POST', headers: {Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/json'}, body: '{}'
+    })).status, 404);
+    assert.equal(sent.length, 0);
     assert.equal((await request(null, {headers: {Authorization: 'Bearer wrong'}})).status, 401);
     assert.equal((await request(failure(), {headers: {Origin: 'https://example.com'}})).status, 403);
     assert.equal((await request(failure())).status, 200);

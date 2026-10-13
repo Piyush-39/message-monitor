@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "IS Message Watchdog",
-  "version": "1.2.2",
-  "description": "Monitor Integration Suite tenants, email failures and generate 24-hour iFlow message reports.",
+  "version": "1.2.3",
+  "description": "Monitor Integration Suite tenants, email failures and detect monitoring interruptions.",
   "minimum_chrome_version": "120",
   "permissions": [
     "activeTab",

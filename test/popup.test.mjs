@@ -10,15 +10,14 @@ test('popup adds a second tenant with scoped permission and targets independent 
       addEventListener(event, handler) {this.click = handler;}
     };
   }
-  const elements = Object.fromEntries(['status', 'token', 'start', 'test', 'report', 'runs'].map(id => [id, element('div', id)]));
+  const elements = Object.fromEntries(['status', 'token', 'start', 'test', 'runs'].map(id => [id, element('div', id)]));
   function flatten(node) {return [node, ...node.children.flatMap(flatten)];}
   globalThis.document = {
     querySelector(selector) {return elements[selector.slice(1)];}, createElement: tag => element(tag),
-    querySelectorAll() {return [elements.start, elements.test, elements.report, ...flatten(elements.runs).filter(node => node.tag === 'button')];}
+    querySelectorAll() {return [elements.start, elements.test, ...flatten(elements.runs).filter(node => node.tag === 'button')];}
   };
   const calls = [];
   let granted = false;
-  let reportDelivery = async () => ({ok: true, value: {status: '24-hour report accepted by Gmail'}});
   const initial = {tenant: TRIAL_TENANT, running: true, status: 'Watching', endsAt: Date.now() + 3600000, sent: 3,
     scope: {artifactIds: ['flow-a', 'flow-b'], packageId: 'package-a'}};
   const state = {runs: [initial], activeCount: 1};
@@ -28,7 +27,6 @@ test('popup adds a second tenant with scoped permission and targets independent 
     storage: {local: {async get() {return {relayToken: 'local-test-key'};}}},
     runtime: {async sendMessage(message) {
       calls.push({message});
-      if (message.type === 'report') return reportDelivery();
       if (message.type === 'start') state.runs.push({tenant: TENANT, running: true, status: 'Watching', endsAt: Date.now() + 3600000, sent: 0});
       if (message.type === 'stop') state.runs.find(run => run.tenant === message.tenant).running = false;
       state.activeCount = state.runs.filter(run => run.running).length;
@@ -67,30 +65,10 @@ test('popup adds a second tenant with scoped permission and targets independent 
   assert.equal(calls[0].message.tenant, TRIAL_TENANT);
   assert.equal(state.runs.find(run => run.tenant === TENANT).running, true);
   assert.equal(state.activeCount, 1);
-  assert.equal(elements.report.disabled, false); // Reports work even while this tenant is running.
-  calls.length = 0; granted = false;
-  await elements.report.click();
-  assert.equal(calls.some(call => call.message?.type === 'report'), false);
-  granted = true; calls.length = 0;
-  await elements.report.click();
-  assert.deepEqual(calls[0], {permission: {origins: [`${TENANT}/*`]}});
-  assert.deepEqual(calls[1].message, {type: 'report', token: 'local-test-key', sourceTabId: 42});
-  assert.match(elements.status.textContent, /report accepted/);
-  assert.equal(state.activeCount, 1);
-  let began, finish;
-  const reading = new Promise(resolve => {began = resolve;});
-  reportDelivery = () => new Promise(resolve => {finish = resolve; began();});
-  const pending = elements.report.click();
-  await reading;
-  assert.equal(elements.report.disabled, true);
   const currentStop = flatten(elements.runs.children[1]).find(node => node.textContent === 'Stop');
   assert.equal(currentStop.disabled, false);
   await currentStop.click();
   assert.equal(state.activeCount, 0);
-  assert.equal(elements.report.disabled, true);
-  finish({ok: true, value: {status: '24-hour report accepted by Gmail'}});
-  await pending;
-  assert.equal(elements.report.disabled, false);
 });
 
 test('multiple tenants still use optional site access without expanded install permissions', async () => {

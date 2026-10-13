@@ -86,7 +86,7 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
       if (emailBroken) return Response.json({error: 'Email unavailable'}, {status: 502});
       delivered.push(body);
     }
-    return relayFetch ? relayFetch(url, options) : Response.json({ok: true, reports: true});
+    return relayFetch ? relayFetch(url, options) : Response.json({ok: true});
   };
   function request(type, tenant, extra = {}) {
     return new Promise(resolve => onMessage({type, token, ...(tenant ? {tenant} : {}), ...extra}, {id: chrome.runtime.id}, resolve));

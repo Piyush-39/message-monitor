@@ -18,10 +18,15 @@ const record = (id, status = 'COMPLETED', flow = 'flow-a', time = from) => ({Mes
 const payload = () => ({tenant: TENANT, from, to, nonce: 'report-request-1', flows: [
   {id: 'flow-a', name: 'Flow A', completed: 2, retry: 1, failed: 3}
 ]});
-function reader(fetcher, origin = TENANT, clock = Date) {
+function readerResult(fetcher, origin = TENANT, clock = Date) {
   return runInNewContext(`(${readMessageReport.toString()})(...args)`, {
     args: [from, to, TENANT], location: new URL(`${origin}/shell/monitoring/Messages/`), URL, Date: clock, AbortSignal, fetch: fetcher
   });
+}
+async function reader(...args) {
+  const result = await readerResult(...args);
+  if (!result.ok) throw new Error(result.error);
+  return result.flows;
 }
 
 test('serialized report counts all statuses by technical ID, deduplicates pages, and enforces start-time boundaries', async () => {
@@ -44,6 +49,9 @@ test('serialized report counts all statuses by technical ID, deduplicates pages,
   ]);
   assert.equal(urls[1].pathname, '/odata/api/v1/MessageProcessingLogs');
   const filter = urls[0].searchParams.get('$filter');
+  assert.equal(urls[0].searchParams.get('$orderby'), 'LogStart desc');
+  assert.equal(urls[0].searchParams.get('$top'), '50');
+  assert.equal(urls[0].searchParams.has('$select'), false);
   assert.equal(filter, `LogStart ge datetime'${new Date(from).toISOString().slice(0, 19)}' and LogStart lt datetime'${new Date(to).toISOString().slice(0, 19)}'`);
   assert.doesNotMatch(filter, /Status|IntegrationArtifact|LogEnd/);
 });
@@ -70,6 +78,58 @@ test('report fails rather than emailing incomplete or untrusted SAP results', as
   await assert.rejects(reader(async () => Response.json({d: {results: [], __next: `/api/v1/MessageProcessingLogs?$skiptoken=${++pages}`}})), /read budget/);
   assert.equal(pages, 200);
   await assert.rejects(reader(async () => Response.json({d: {results: Array.from({length: 1001}, (_, index) => record(`message-${index}`, 'COMPLETED', `flow-${index}`))}})), /Too many iFlows/);
+});
+
+test('page reader returns serializable errors instead of rejected promises across the Chrome boundary', async () => {
+  const cases = [
+    {fetcher: async () => new Response('', {status: 401}), expected: /session expired or access denied/},
+    {fetcher: async () => new Response('login', {headers: {'content-type': 'text/html'}}), expected: /login page/},
+    {fetcher: async () => Response.json({error: {message: {value: 'Unsupported projection\nTry a full record'}}}, {status: 400}), expected: /HTTP 400\. Unsupported projection Try a full record/},
+    {fetcher: async () => {throw Object.assign(new Error('network timeout'), {name: 'TimeoutError'});}, expected: /request timed out/},
+    {fetcher: async () => Response.json({d: {results: [{...record('one'), IntegrationArtifact: null}]}}), expected: /without its iFlow ID/}
+  ];
+  for (const {fetcher, expected} of cases) {
+    const result = JSON.parse(JSON.stringify(await readerResult(fetcher)));
+    assert.equal(result.ok, false);
+    assert.match(result.error, expected);
+    assert.equal('flows' in result, false);
+    assert.equal('stack' in result, false);
+  }
+});
+
+test('browser-session report avoids projection and composite sorting and accepts OData or ISO start times', async () => {
+  const rows = await reader(async url => {
+    const params = new URL(url).searchParams;
+    if (params.has('$select') || params.get('$orderby').includes(',') || Number(params.get('$top')) > 50) {
+      return Response.json({error: {message: {value: 'Unsupported browser-session query'}}}, {status: 400});
+    }
+    return Response.json({d: {results: [
+      {...record('iso-start'), LogStart: new Date(from).toISOString()},
+      {...record('offset-start', 'RETRY'), LogStart: new Date(from).toISOString().replace('Z', '+00:00')},
+      record('odata-start', 'FAILED')
+    ]}});
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(rows)), [{id: 'flow-a', name: 'Same display name', completed: 1, retry: 1, failed: 1}]);
+  await assert.rejects(reader(async () => Response.json({d: {results: [{...record('bad-start'), LogStart: 'not-a-date'}]}})), /valid processing start time/);
+});
+
+test('popup response preserves SAP errors when executeScript resolves without exposing thrown page exceptions', async () => {
+  const h = await backgroundHarness();
+  try {
+    await h.start(TRIAL_TENANT);
+    const before = structuredClone(h.store.state);
+    h.sap.set(TENANT, () => Response.json({error: {message: {value: 'Invalid OData query option'}}}, {status: 400}));
+    const failed = await h.request('report', null, {sourceTabId: 1});
+    assert.equal(failed.ok, false);
+    assert.match(failed.error, /HTTP 400\. Invalid OData query option/);
+    assert.doesNotMatch(failed.error, /^SAP report failed;/);
+    assert.equal(h.delivered.length, 0);
+    assert.deepEqual(h.store.state, before);
+    h.sap.set(TENANT, [record('fixed', 'RETRY', 'flow-a', h.time - 1000)]);
+    assert.equal((await h.request('report', null, {sourceTabId: 1})).ok, true);
+    assert.equal(h.delivered.length, 1);
+    assert.equal(h.delivered[0].flows[0].retry, 1);
+  } finally {h.close();}
 });
 
 test('report contract rejects malformed windows, duplicate rows, negative/unsafe counts and oversized reports', () => {

@@ -58,6 +58,8 @@ The report makes authenticated GET requests only. It does not change tenant conf
 
 Version 1.2.0 requires the updated relay for reports; the popup tells you if its relay is too old before reading SAP. Upgrade the relay and reload the extension **on the device that will generate reports**. Existing alert and heartbeat endpoints remain compatible with older extension versions. Each device has its own Chrome storage, local relay, `.env`, and delivery receipts; updating a checkout or opening a PR does not update installations on another device. Do not reload the extension, restart the relay, or replace files on the other monitoring device during development. The report uses the signed-in session on the device where its button is clicked; it cannot access a Chrome session on another device.
 
+For the **1.2.1 report-reader fix**, reload the existing extension after updating its files. The report now uses the monitor's 50-record browser-session query without a field projection or composite sort and accepts OData and ISO UTC/offset start times. Page-reader failures return a structured result to the extension, so the popup displays the SAP HTTP error, sign-in requirement, invalid response or timeout instead of the generic “SAP report failed” message. An already-running 1.2.0 relay does not need to be restarted for this fix.
+
 ## Session and laptop behavior
 
 Each check sends an actual authenticated SAP read request. For an inactivity timeout, these requests are intended to keep the session active. This was verified as an authenticated HTTP 200 read on your tenant; continuous operation beyond 15 minutes and a full nine-hour shift still need live validation. Tenant or identity-provider policies can still require reauthentication.

@@ -67,8 +67,10 @@ async function report(token, sourceTabId) {
     const to = Math.floor(Date.now() / 1000) * 1000;
     const from = to - 86400000;
     const result = await chrome.scripting.executeScript({target: {tabId: sourceTabId}, world: 'MAIN', func: readMessageReport, args: [from, to, tenant]});
-    if (!Array.isArray(result[0]?.result)) throw new Error('SAP report failed; no report was emailed.');
-    const payload = validateReport({tenant, from, to, nonce: crypto.randomUUID(), flows: result[0].result});
+    const read = result?.find(frame => frame.frameId === 0)?.result ?? result?.[0]?.result;
+    if (read?.ok === false && typeof read.error === 'string') throw new Error(read.error);
+    if (read?.ok !== true || !Array.isArray(read.flows)) throw new Error('SAP report reader did not return data. Reload the extension and the tenant page, then try again; no report was emailed.');
+    const payload = validateReport({tenant, from, to, nonce: crypto.randomUUID(), flows: read.flows});
     await relay('/report', token, payload);
     await chrome.storage.local.set({relayToken: token});
     return {status: `24-hour report accepted by Gmail for ${new URL(tenant).hostname} (${payload.flows.length} iFlows).`};

@@ -4,18 +4,15 @@ const status = document.querySelector('#status');
 const token = document.querySelector('#token');
 const start = document.querySelector('#start');
 const test = document.querySelector('#test');
-const report = document.querySelector('#report');
 const list = document.querySelector('#runs');
 let busy = false;
-let reporting = false;
 start.disabled = true;
-report.disabled = true;
 const [source] = await chrome.tabs.query({active: true, currentWindow: true});
 const tenant = monitorTenant(source?.url);
 
 async function send(type, targetTenant) {
   const result = await chrome.runtime.sendMessage({type, token: token.value.trim(),
-    ...(['start', 'report'].includes(type) ? {sourceTabId: source?.id} : {}), ...(targetTenant ? {tenant: targetTenant} : {})});
+    ...(type === 'start' ? {sourceTabId: source?.id} : {}), ...(targetTenant ? {tenant: targetTenant} : {})});
   if (!result.ok) throw new Error(result.error);
   return result.value;
 }
@@ -24,7 +21,6 @@ async function render(notice = '') {
   const currentRunning = state.runs.some(run => run.tenant === tenant && run.running);
   start.disabled = busy || currentRunning;
   test.disabled = busy;
-  report.disabled = busy || reporting || !tenant;
   status.textContent = notice || `${state.activeCount} tenant${state.activeCount === 1 ? '' : 's'} running.\n${tenant ? `${currentRunning ? 'Already watching' : 'Ready to start'}: ${new URL(tenant).hostname}` : 'Open a tenant’s Monitor Message Processing page to add it.'}`;
   list.replaceChildren();
   for (const run of state.runs) {
@@ -34,7 +30,8 @@ async function render(notice = '') {
     heading.textContent = new URL(run.tenant).hostname;
     const detail = document.createElement('p');
     detail.textContent = `${run.status}\nEnds: ${new Date(run.endsAt).toLocaleTimeString()}\nFailed messages emailed: ${run.sent}`;
-    detail.textContent += `\nArtifacts: ${run.scope?.artifactIds?.length ? run.scope.artifactIds.join(', ') : 'All'}`;
+    const count = new Set(run.scope?.artifactIds || []).size;
+    detail.textContent += `\nMonitoring: ${count ? `${count} iFlow${count === 1 ? '' : 's'}` : run.scope?.packageId ? 'All iFlows in the selected package' : 'All iFlows'}`;
     if (run.scope?.packageId) detail.textContent += `\nPackage: ${run.scope.packageId}`;
     if (run.lastCheck) detail.textContent += `\nLast check: ${new Date(run.lastCheck).toLocaleTimeString()}`;
     if (run.lastRefresh) detail.textContent += `\nLast table refresh: ${new Date(run.lastRefresh).toLocaleTimeString()}`;
@@ -58,32 +55,24 @@ async function render(notice = '') {
   }
 }
 async function act(type, targetTenant) {
-  if (type === 'report') {
-    reporting = true;
-    report.disabled = true;
-  } else {
-    busy = true;
-    document.querySelectorAll('button').forEach(button => {button.disabled = true;});
-  }
+  busy = true;
+  document.querySelectorAll('button').forEach(button => {button.disabled = true;});
   let notice = '';
   try {
-    if (type === 'start' || type === 'report') {
+    if (type === 'start') {
       if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
       // Resolve the source before clicking; the permission request stays in the user gesture.
-      if (!(await chrome.permissions.request({origins: [`${tenant}/*`]}))) throw new Error(`Tenant access was declined. Click ${type === 'start' ? 'Start' : 'Email 24-hour report'} again and allow access to this tenant.`);
+      if (!(await chrome.permissions.request({origins: [`${tenant}/*`]}))) throw new Error('Tenant access was declined. Click Start again and allow access to this tenant.');
     }
-    if (type === 'report') status.textContent = 'Reading the last 24 hours and emailing the report… Monitoring continues.';
     const result = await send(type, targetTenant);
-    if (type === 'test' || type === 'report') notice = result.status;
+    if (type === 'test') notice = result.status;
   } catch (error) {notice = error.message;}
   finally {
-    if (type === 'report') reporting = false;
-    else busy = false;
+    busy = false;
     await render(notice);
   }
 }
 start.addEventListener('click', () => act('start'));
 test.addEventListener('click', () => act('test'));
-report.addEventListener('click', () => act('report'));
 token.value = (await chrome.storage.local.get('relayToken')).relayToken || '';
 await render();

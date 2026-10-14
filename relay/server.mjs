@@ -18,8 +18,12 @@ export function validateAlert(value) {
     if (!Number.isSafeInteger(value.episode) || typeof value.problem !== 'string' || value.problem.length > 400) throw new Error('Invalid problem');
     return value;
   }
-  if (value.kind !== 'failures' || !Array.isArray(value.messages) || !value.messages.length || value.messages.length > 50) throw new Error('Invalid message batch');
+  // Accept legacy failure-only extensions during the upgrade as well.
+  if (!['messages', 'failures'].includes(value.kind) || !Array.isArray(value.messages) || !value.messages.length || value.messages.length > 50) throw new Error('Invalid message batch');
   for (const message of value.messages) {
+    if (value.kind === 'messages' || message.status !== undefined) {
+      if (typeof message.status !== 'string' || !/^[A-Z][A-Z0-9_]{0,49}$/.test(message.status) || ['COMPLETED', 'ALL'].includes(message.status)) throw new Error('Invalid message status');
+    }
     if (typeof message.id !== 'string' || !/^[\w-]{1,200}$/.test(message.id)) throw new Error('Invalid message ID');
     if (typeof message.flow !== 'string' || message.flow.length > 300 || typeof message.time !== 'string' || message.time.length > 50) throw new Error('Invalid message');
     const url = new URL(message.url);
@@ -40,11 +44,11 @@ export function composeEmail(alert) {
   };
   if (alert.kind === 'problem') return {
     subject: `IS Watchdog: monitoring needs attention — ${new URL(alert.tenant).hostname}`,
-    text: `Monitoring cannot currently confirm new failed messages.\n\n${alert.problem}\n\nOpen the watchdog tab and sign in again if needed. Checks will retry every minute until the nine-hour run ends.\n\n${alert.tenant}/shell/monitoring`
+    text: `Monitoring cannot currently confirm new non-Completed messages.\n\n${alert.problem}\n\nOpen the watchdog tab and sign in again if needed. Checks will retry every minute until the nine-hour run ends.\n\n${alert.tenant}/shell/monitoring`
   };
   return {
-    subject: `IS Watchdog: ${alert.messages.length} new failed message${alert.messages.length === 1 ? '' : 's'} — ${new URL(alert.tenant).hostname}`,
-    text: alert.messages.map(message => `Status: FAILED\nFlow: ${message.flow}\nMessage ID: ${message.id}\nTime: ${message.time || 'Unavailable'}\nOpen: ${message.url}`).join('\n\n')
+    subject: `IS Watchdog: ${alert.messages.length} new non-Completed message${alert.messages.length === 1 ? '' : 's'} — ${new URL(alert.tenant).hostname}`,
+    text: alert.messages.map(message => `Status: ${message.status ?? 'FAILED'}\nFlow: ${message.flow}\nMessage ID: ${message.id}\nTime: ${message.time || 'Unavailable'}\nOpen: ${message.url}`).join('\n\n')
   };
 }
 async function jsonBody(request, limit = 100000) {
@@ -73,15 +77,16 @@ export async function createRelay({token, user, recipient, transport, stateFile 
   async function deliver(alert) {
     const key = alertKey(alert);
     if (receipts[key]) return {ok: true, duplicate: true};
-    const filtered = alert.kind === 'failures' ? {...alert, messages: alert.messages.filter(message =>
+    const isMessageBatch = ['messages', 'failures'].includes(alert.kind);
+    const filtered = isMessageBatch ? {...alert, messages: alert.messages.filter(message =>
       !receipts[`message:${alert.tenant}:${message.id}`] && !(alert.tenant === LEGACY_TENANT && receipts[`message:${message.id}`])
     )} : alert;
-    if (filtered.kind === 'failures' && !filtered.messages.length) return {ok: true, duplicate: true};
+    if (isMessageBatch && !filtered.messages.length) return {ok: true, duplicate: true};
     const mail = composeEmail(filtered);
     const info = await transport.sendMail({from: user, to: recipient, ...mail});
     if (!info.accepted?.length || info.rejected?.length) throw new Error('Gmail did not accept the recipient');
     receipts[key] = Date.now();
-    if (filtered.kind === 'failures') for (const message of filtered.messages) receipts[`message:${alert.tenant}:${message.id}`] = Date.now();
+    if (isMessageBatch) for (const message of filtered.messages) receipts[`message:${alert.tenant}:${message.id}`] = Date.now();
     await writeFile(`${stateFile}.tmp`, JSON.stringify(receipts), {mode: 0o600});
     await rename(`${stateFile}.tmp`, stateFile);
     return {ok: true};

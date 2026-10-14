@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {TENANT, TRIAL_TENANT} from './fixtures.mjs';
+import {EMAIL_STATUSES} from '../extension/core.js';
 
 test('popup adds a second tenant with scoped permission and targets independent Open/Stop buttons', async () => {
   function element(tag, id) {
@@ -10,7 +11,7 @@ test('popup adds a second tenant with scoped permission and targets independent 
       addEventListener(event, handler) {this.click = handler;}
     };
   }
-  const elements = Object.fromEntries(['status', 'token', 'start', 'test', 'runs'].map(id => [id, element('div', id)]));
+  const elements = Object.fromEntries(['status', 'token', 'start', 'test', 'runs', 'email-statuses', 'status-options'].map(id => [id, element('div', id)]));
   function flatten(node) {return [node, ...node.children.flatMap(flatten)];}
   globalThis.document = {
     querySelector(selector) {return elements[selector.slice(1)];}, createElement: tag => element(tag),
@@ -19,7 +20,7 @@ test('popup adds a second tenant with scoped permission and targets independent 
   const calls = [];
   let granted = false;
   const initial = {tenant: TRIAL_TENANT, running: true, status: 'Watching', endsAt: Date.now() + 3600000, sent: 3,
-    scope: {artifactIds: ['flow-a', 'flow-b'], packageId: 'package-a'}};
+    scope: {artifactIds: ['flow-a', 'flow-b'], packageId: 'package-a'}, emailStatuses: ['ESCALATED']};
   const state = {runs: [initial], activeCount: 1};
   globalThis.chrome = {
     tabs: {async query() {return [{id: 42, url: `${TENANT}/shell/monitoring/Messages/`}];}},
@@ -27,14 +28,23 @@ test('popup adds a second tenant with scoped permission and targets independent 
     storage: {local: {async get() {return {relayToken: 'local-test-key'};}}},
     runtime: {async sendMessage(message) {
       calls.push({message});
-      if (message.type === 'start') state.runs.push({tenant: TENANT, running: true, status: 'Watching', endsAt: Date.now() + 3600000, sent: 0});
+      if (message.type === 'start') state.runs.push({tenant: TENANT, running: true, status: 'Watching', endsAt: Date.now() + 3600000, sent: 0, emailStatuses: message.emailStatuses});
+      if (message.type === 'updateStatuses') state.runs.find(run => run.tenant === message.tenant).emailStatuses = message.emailStatuses;
       if (message.type === 'stop') state.runs.find(run => run.tenant === message.tenant).running = false;
       state.activeCount = state.runs.filter(run => run.running).length;
       return {ok: true, value: state};
     }}
   };
   await import('../extension/popup.js');
+  const inputs = () => flatten(elements['status-options']).filter(node => node.tag === 'input');
+  const choose = statuses => inputs().forEach(input => {input.checked = statuses.includes(input.value);});
+  assert.deepEqual(inputs().filter(input => input.checked).map(input => input.value), EMAIL_STATUSES);
   assert.equal(elements.start.disabled, false); // Another active tenant doesn't block Start.
+  choose([]); calls.length = 0;
+  await elements.start.click();
+  assert.match(elements.status.textContent, /Select at least one/);
+  assert.equal(calls.some(call => call.permission || call.message?.type === 'start'), false);
+  choose(['FAILED', 'RETRY']);
   calls.length = 0;
   await elements.start.click();
   assert.deepEqual(calls[0], {permission: {origins: [`${TENANT}/*`]}});
@@ -42,14 +52,26 @@ test('popup adds a second tenant with scoped permission and targets independent 
   assert.match(elements.status.textContent, /access was declined/);
   granted = true; calls.length = 0;
   await elements.start.click();
-  assert.deepEqual(calls[1].message, {type: 'start', token: 'local-test-key', sourceTabId: 42});
-  assert.equal(elements.start.disabled, true);
+  assert.deepEqual(calls[1].message, {type: 'start', token: 'local-test-key', sourceTabId: 42, emailStatuses: ['FAILED', 'RETRY']});
+  assert.equal(elements.start.disabled, false);
+  assert.equal(elements.start.textContent, 'Save statuses');
   assert.equal(elements.runs.children.length, 2);
   const firstCard = elements.runs.children[0];
   assert.equal(firstCard.children[0].textContent, new URL(TRIAL_TENANT).hostname);
   assert.match(firstCard.children[1].textContent, /Monitoring: 2 iFlows\nPackage: package-a/);
+  assert.match(firstCard.children[1].textContent, /Messages emailed: 3\nEmail statuses: Escalated/);
+  assert.match(elements.runs.children[1].children[1].textContent, /Email statuses: Failed, Retry/);
   assert.doesNotMatch(firstCard.children[1].textContent, /flow-a|flow-b/);
   assert.match(elements.runs.children[1].children[1].textContent, /Monitoring: All iFlows/);
+  choose(['PROCESSING']); calls.length = 0;
+  await elements.start.click();
+  assert.deepEqual(calls[0].message, {type: 'updateStatuses', token: 'local-test-key', tenant: TENANT, emailStatuses: ['PROCESSING']});
+  assert.equal(calls.some(call => call.permission), false);
+  assert.match(elements.runs.children[1].children[1].textContent, /Email statuses: Processing/);
+  assert.deepEqual(initial.emailStatuses, ['ESCALATED']);
+  elements['status-options'].children = [];
+  await import('../extension/popup.js?reopen');
+  assert.deepEqual(inputs().filter(input => input.checked).map(input => input.value), ['PROCESSING']);
   initial.scope = {artifactIds: ['only-flow', 'only-flow'], packageId: null};
   await elements.test.click();
   assert.match(elements.runs.children[0].children[1].textContent, /Monitoring: 1 iFlow$/);

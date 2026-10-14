@@ -1,5 +1,5 @@
-import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, DURATION, POLL_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
-import { readFailedMessages, refreshMessageTable } from './poll.js';
+import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, emailStatuses, DURATION, POLL_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
+import { readNonCompletedMessages, refreshMessageTable } from './poll.js';
 
 const RELAY = 'http://127.0.0.1:43171';
 let state;
@@ -45,7 +45,7 @@ async function read(run, since) {
   if (!(await chrome.permissions.contains({origins: [`${tenant}/*`]}))) throw new Error('Tenant access missing. Stop and click Start on this tenant to allow access.');
   const tab = await chrome.tabs.get(tabId);
   if (monitorTenant(tab.url) !== tenant) throw new Error('Watchdog tab closed or signed out. Sign in again in this tenant.');
-  const result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readFailedMessages, args: [since, tenant, run.scope || {}]});
+  const result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readNonCompletedMessages, args: [since, tenant, run.scope || {}, emailStatuses(run.emailStatuses)]});
   if (!Array.isArray(result[0]?.result)) throw new Error(result[0]?.error?.message || 'SAP check failed. Sign in again if the tab shows a login page.');
   return result[0].result;
 }
@@ -81,7 +81,8 @@ async function stop(tenant, reason = 'Stopped') {
   await updateControls();
   return {status: reason};
 }
-async function start(token, sourceTabId) {
+async function start(token, sourceTabId, selectedStatuses) {
+  const statuses = emailStatuses(selectedStatuses);
   const source = Number.isInteger(sourceTabId) ? await chrome.tabs.get(sourceTabId) : (await chrome.tabs.query({active: true, currentWindow: true}))[0];
   const tenant = monitorTenant(source?.url);
   if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
@@ -89,12 +90,12 @@ async function start(token, sourceTabId) {
   const {filter, scope} = monitorSelection(source.url);
   if (state.runs[tenant]?.running) await stop(tenant, 'Nine-hour run finished');
   await relay('/health', token);
-  const baseline = await read({tenant, tabId: source.id, scope}, Date.now() - 60 * 60 * 1000);
-  const watchdogFilter = {...filter, status: 'FAILED', time: 'PASTHOUR'};
+  const baseline = await read({tenant, tabId: source.id, scope, emailStatuses: statuses}, Date.now() - 60 * 60 * 1000);
+  const watchdogFilter = {...filter, status: 'ALL', time: 'PASTHOUR'};
   const tab = await chrome.tabs.create({url: `${tenant}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify(watchdogFilter))}`, active: false});
   const startedAt = Date.now();
   const run = {
-    running: true, token, tenant, scope, tabId: tab.id, startedAt, endsAt: startedAt + DURATION,
+    running: true, token, tenant, scope, emailStatuses: statuses, tabId: tab.id, startedAt, endsAt: startedAt + DURATION,
     seen: baseline.map(message => message.id), sent: 0, lastCheck: startedAt,
     status: 'Watching', problem: null, problemEpisode: null
   };
@@ -119,7 +120,7 @@ async function tick(run) {
     for (let fresh = unseenMessages(messages, run.seen), offset = 0; offset < fresh.length; offset += 50) {
       if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
       const batch = fresh.slice(offset, offset + 50);
-      await relay('/alert', run.token, {kind: 'failures', run: run.startedAt, tenant: run.tenant, messages: batch});
+      await relay('/alert', run.token, {kind: 'messages', run: run.startedAt, tenant: run.tenant, messages: batch});
       run.seen.push(...batch.map(message => message.id));
       run.sent += batch.length;
       await save();
@@ -163,6 +164,7 @@ async function tickAll() {
 }
 function publicState() {
   const runs = Object.values(state.runs).map(({token, seen, ...run}) => ({...run, running: activeRun(run),
+    emailStatuses: emailStatuses(run.emailStatuses),
     status: run.running && !activeRun(run) ? 'Nine-hour run finished' : run.status}));
   return {runs, activeCount: runs.filter(run => activeRun(run)).length};
 }
@@ -180,7 +182,14 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || sender.tab) return;
   serialize(async () => {
     if (message.type === 'status') return publicState();
-    if (message.type === 'start') return start(message.token, message.sourceTabId);
+    if (message.type === 'start') return start(message.token, message.sourceTabId, message.emailStatuses);
+    if (message.type === 'updateStatuses') {
+      const run = state.runs[message.tenant];
+      if (!activeRun(run)) throw new Error('Start monitoring this tenant first.');
+      run.emailStatuses = emailStatuses(message.emailStatuses);
+      await save();
+      return {status: 'Email statuses saved. They apply from the next check.'};
+    }
     if (message.type === 'stop') return stop(message.tenant);
     if (message.type === 'open') {
       const run = state.runs[message.tenant];

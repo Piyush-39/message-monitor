@@ -19,7 +19,7 @@ export function refreshMessageTable(expectedOrigin) {
   return true;
 }
 
-export async function readFailedMessages(since, expectedOrigin, scope = {}) {
+export async function readNonCompletedMessages(since, expectedOrigin, scope = {}, emailStatuses) {
   const origin = location.origin;
   if (origin !== expectedOrigin) {
     throw new Error('SAP tab has left the tenant. Sign in again.');
@@ -30,11 +30,17 @@ export async function readFailedMessages(since, expectedOrigin, scope = {}) {
       (scope.packageId != null && typeof scope.packageId !== 'string')) throw new Error('Invalid artifact monitoring scope.');
   // OData string literals escape apostrophes by doubling them, not by URL encoding.
   const literal = value => `'${value.replace(/'/g, "''")}'`;
-  const filters = [`Status eq 'FAILED' and LogEnd ge datetime'${new Date(since).toISOString().slice(0, 19)}'`];
+  if (emailStatuses !== undefined && (!Array.isArray(emailStatuses) || !emailStatuses.length ||
+      emailStatuses.some(status => typeof status !== 'string' || !/^[A-Z][A-Z0-9_]{0,49}$/.test(status) || ['ALL', 'COMPLETED'].includes(status)))) throw new Error('Invalid email status selection.');
+  const statusFilter = emailStatuses === undefined ? "Status ne 'COMPLETED'" : `(${emailStatuses.map(status => `Status eq ${literal(status)}`).join(' or ')})`;
+  const timestamp = new Date(since).toISOString().slice(0, 19);
+  // Processing/retrying messages may not have an end time yet. Keep LogEnd too
+  // so a message started before the run but ending during it can still be found.
+  const filters = [`${statusFilter} and (LogStart ge datetime'${timestamp}' or LogEnd ge datetime'${timestamp}')`];
   if (artifactIds.length) filters.push(`(${artifactIds.map(id => `IntegrationArtifact/Id eq ${literal(id)}`).join(' or ')})`);
   if (scope.packageId) filters.push(`IntegrationArtifact/PackageId eq ${literal(scope.packageId)}`);
   url.searchParams.set('$format', 'json');
-  url.searchParams.set('$orderby', 'LogEnd desc');
+  url.searchParams.set('$orderby', 'LogStart desc');
   url.searchParams.set('$top', '50');
   url.searchParams.set('$filter', filters.join(' and '));
   const messages = [];
@@ -62,16 +68,19 @@ export async function readFailedMessages(since, expectedOrigin, scope = {}) {
     const body = await response.json();
     if (!Array.isArray(body.d?.results)) throw new Error('Unexpected SAP monitoring response.');
     for (const item of body.d.results) {
-      if (item.Status !== 'FAILED') continue;
+      if (item.Status === 'COMPLETED') continue;
+      if (typeof item.Status !== 'string' || !/^[A-Z][A-Z0-9_]{0,49}$/.test(item.Status) || item.Status === 'ALL') throw new Error('SAP returned a message without a valid status.');
+      if (emailStatuses && !emailStatuses.includes(item.Status)) continue;
       // Check every result too: a malformed/mis-scoped pagination response must not email other iFlows.
       if (artifactIds.length && typeof item.IntegrationArtifact?.Id !== 'string') throw new Error('SAP returned a message without its artifact ID for filtered monitoring.');
       if (scope.packageId && typeof item.IntegrationArtifact?.PackageId !== 'string') throw new Error('SAP returned a message without its package ID for filtered monitoring.');
       if (artifactIds.length && !artifactIds.includes(item.IntegrationArtifact.Id)) continue;
       if (scope.packageId && item.IntegrationArtifact.PackageId !== scope.packageId) continue;
-      if (typeof item.MessageGuid !== 'string' || !item.MessageGuid) throw new Error('Failed message has no message ID.');
-      const date = /\/Date\((\d+)(?:[+-]\d+)?\)\//.exec(item.LogEnd || '');
+      if (typeof item.MessageGuid !== 'string' || !item.MessageGuid) throw new Error('Message has no message ID.');
+      const date = /\/Date\((\d+)(?:[+-]\d+)?\)\//.exec(item.LogEnd || item.LogStart || '');
       messages.push({
         id: item.MessageGuid,
+        status: item.Status,
         flow: String(item.IntegrationFlowName || item.IntegrationArtifact?.Name || 'Unknown flow').slice(0, 300),
         time: date ? new Date(Number(date[1])).toISOString() : '',
         url: `${origin}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify({identifier: item.MessageGuid}))}`

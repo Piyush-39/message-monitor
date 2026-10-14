@@ -25,6 +25,14 @@ export function monitorSelection(url) {
   return {filter, scope: {artifactIds: [...new Set(ids)], packageId: filter.packageId && filter.packageId !== 'ALL' ? filter.packageId : null}};
 }
 export const DURATION = 9 * 60 * 60 * 1000;
+export const EMAIL_STATUSES = ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED'];
+export const statusLabel = status => status[0] + status.slice(1).toLowerCase();
+export function emailStatuses(value = EMAIL_STATUSES) {
+  if (!Array.isArray(value) || !value.length || value.some(status => !EMAIL_STATUSES.includes(status))) {
+    throw new Error('Select at least one email status. Completed is always excluded.');
+  }
+  return EMAIL_STATUSES.filter(status => value.includes(status));
+}
 export const POLL_ALARM = 'is-watchdog-poll';
 export const END_ALARM = 'is-watchdog-end';
 export const endAlarm = tenant => `${END_ALARM}:${tenant}`;

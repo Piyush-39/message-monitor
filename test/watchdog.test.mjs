@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readFailedMessages } from '../extension/poll.js';
+import { readNonCompletedMessages } from '../extension/poll.js';
 import { unseenMessages, activeRun, DURATION, monitorTenant, monitorSelection, isTenantOrigin } from '../extension/core.js';
 import { TENANT, TRIAL_TENANT, OTHER_TENANTS } from './fixtures.mjs';
 import { createRelay, composeEmail } from '../relay/server.mjs';
@@ -44,7 +44,7 @@ test('uses exact artifact IDs with escaped OData literals and excludes other flo
       return json({d: {results: [scoped('selected-a', "flow'a"), scoped('unselected', 'flow-c')], __next: '/api/v1/MessageProcessingLogs?$skiptoken=two'}});
     }
     return json({d: {results: [scoped('selected-b', 'flow-b'), scoped('wrong-package', 'flow-b', 'other'), scoped('unselected-page-two', 'flow-c')]}});
-  }, () => readFailedMessages(Date.now(), TENANT, scope));
+  }, () => readNonCompletedMessages(Date.now(), TENANT, scope));
   assert.deepEqual(records.map(record => record.id), ['selected-a', 'selected-b']);
   assert.equal(pages, 2);
 });
@@ -55,13 +55,13 @@ test('package-only monitoring restricts results and missing scope metadata fails
     assert.match(filter, /IntegrationArtifact\/PackageId eq 'package-a'/);
     assert.doesNotMatch(filter, /IntegrationArtifact\/Id/);
     return json({d: {results: [scoped('in-package', 'package-a'), scoped('out-of-package', 'package-b')]}});
-  }, () => readFailedMessages(Date.now(), TENANT, {packageId: 'package-a'}));
+  }, () => readNonCompletedMessages(Date.now(), TENANT, {packageId: 'package-a'}));
   assert.deepEqual(records.map(record => record.id), ['in-package']);
   for (const scope of [{artifactIds: ['flow-a']}, {packageId: 'package-a'}]) {
-    await assert.rejects(withSAP(async () => json({d: {results: [item('missing-metadata')]}}), () => readFailedMessages(Date.now(), TENANT, scope)), /without its (artifact|package) ID/);
+    await assert.rejects(withSAP(async () => json({d: {results: [item('missing-metadata')]}}), () => readNonCompletedMessages(Date.now(), TENANT, scope)), /without its (artifact|package) ID/);
   }
 });
-test('reads authenticated FAILED messages and follows browser-route pagination', async () => {
+test('reads authenticated non-Completed messages and follows browser-route pagination', async () => {
   const urls = [];
   const records = await withSAP(async (url, options) => {
     urls.push(new URL(url));
@@ -69,26 +69,58 @@ test('reads authenticated FAILED messages and follows browser-route pagination',
     assert.equal(options.cache, 'no-store');
     if (urls.length === 1) return json({d: {results: [item('one'), item('complete', 'COMPLETED')], __next: `${TENANT}/api/v1/MessageProcessingLogs?$skiptoken=two`}});
     return json({d: {results: [item('two')]}});
-  }, () => readFailedMessages(1791610000000, TENANT));
+  }, () => readNonCompletedMessages(1791610000000, TENANT));
   assert.deepEqual(records.map(record => record.id), ['one', 'two']);
   assert.equal(records[0].time, '2026-10-10T07:49:45.000Z');
   assert.equal(urls[1].pathname, '/odata/api/v1/MessageProcessingLogs');
-  assert.match(urls[0].searchParams.get('$filter'), /^Status eq 'FAILED' and LogEnd ge datetime'/);
+  assert.match(urls[0].searchParams.get('$filter'), /^Status ne 'COMPLETED' and \(LogStart ge datetime'.*' or LogEnd ge datetime'.*'\)/);
   assert.match(records[0].url, /shell\/monitoring\/Messages\//);
 });
+test('includes every non-Completed status across pages, including messages without an end time', async () => {
+  const statuses = ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED'];
+  let page = 0;
+  const records = await withSAP(async url => {
+    if (++page === 1) {
+      const filter = new URL(url).searchParams.get('$filter');
+      assert.equal(filter, "Status ne 'COMPLETED' and (LogStart ge datetime'2026-10-10T05:26:40' or LogEnd ge datetime'2026-10-10T05:26:40')");
+      assert.equal(new URL(url).searchParams.get('$orderby'), 'LogStart desc');
+      return json({d: {results: [...statuses.slice(0, 3).map(status => ({...item(status, status), LogEnd: null, LogStart: '/Date(1791618585000)/'})), item('completed', 'COMPLETED')], __next: '/api/v1/MessageProcessingLogs?$skiptoken=two'}});
+    }
+    return json({d: {results: [...statuses.slice(3).map(status => item(status, status)), item('completed-page-two', 'COMPLETED')]}});
+  }, () => readNonCompletedMessages(1791610000000, TENANT));
+  assert.deepEqual(records.map(record => record.status), statuses);
+  assert.equal(records[2].time, '2026-10-10T07:49:45.000Z');
+});
 test('empty results are healthy but login HTML, access errors and malformed data are not', async () => {
-  assert.deepEqual(await withSAP(async () => json({d: {results: []}}), () => readFailedMessages(Date.now(), TENANT)), []);
+  assert.deepEqual(await withSAP(async () => json({d: {results: []}}), () => readNonCompletedMessages(Date.now(), TENANT)), []);
   for (const response of [
     new Response('login', {headers: {'content-type': 'text/html'}}),
     new Response('', {status: 401}), new Response('', {status: 403}),
     new Response('', {status: 500}), json({d: {}}), json({d: {results: [item('')]}})
-  ]) await assert.rejects(withSAP(async () => response, () => readFailedMessages(Date.now(), TENANT)));
+  ]) await assert.rejects(withSAP(async () => response, () => readNonCompletedMessages(Date.now(), TENANT)));
+});
+test('selected statuses constrain SAP queries and every response page together with artifact filters', async () => {
+  const selected = (id, status = 'FAILED', artifact = 'flow-a') => ({...item(id, status), IntegrationArtifact: {Id: artifact}});
+  let pages = 0;
+  const records = await withSAP(async url => {
+    if (++pages === 1) {
+      const filter = new URL(url).searchParams.get('$filter');
+      assert.match(filter, /^\(Status eq 'FAILED' or Status eq 'RETRY'\) and \(LogStart/);
+      assert.match(filter, /and \(IntegrationArtifact\/Id eq 'flow-a'\)$/);
+      return json({d: {results: [selected('failed'), selected('processing', 'PROCESSING')], __next: '/api/v1/MessageProcessingLogs?$skiptoken=two'}});
+    }
+    return json({d: {results: [selected('retry', 'RETRY'), selected('other-flow', 'FAILED', 'other'), selected('completed', 'COMPLETED')]}});
+  }, () => readNonCompletedMessages(Date.now(), TENANT, {artifactIds: ['flow-a']}, ['FAILED', 'RETRY']));
+  assert.deepEqual(records.map(record => record.id), ['failed', 'retry']);
+  for (const statuses of [[], null, ['COMPLETED'], ['ALL'], ["FAILED' or true"], 'FAILED']) {
+    await assert.rejects(withSAP(async () => {throw new Error('Should not fetch');}, () => readNonCompletedMessages(Date.now(), TENANT, {}, statuses)), /Invalid email status selection/);
+  }
 });
 test('rejects pagination loops and links outside the tenant', async () => {
   for (const next of ['https://example.com/api/v1/MessageProcessingLogs', `${TENANT}/api/v1/Attachments`]) {
-    await assert.rejects(withSAP(async () => json({d: {results: [], __next: next}}), () => readFailedMessages(Date.now(), TENANT)), /pagination URL/);
+    await assert.rejects(withSAP(async () => json({d: {results: [], __next: next}}), () => readNonCompletedMessages(Date.now(), TENANT)), /pagination URL/);
   }
-  await assert.rejects(withSAP(async url => json({d: {results: [], __next: url}}), () => readFailedMessages(Date.now(), TENANT)), /did not finish/);
+  await assert.rejects(withSAP(async url => json({d: {results: [], __next: url}}), () => readNonCompletedMessages(Date.now(), TENANT)), /did not finish/);
 });
 test('deduplicates IDs while preserving distinct failures in the same flow/time', () => {
   const messages = [item('old'), item('new'), item('new'), item('other')].map(value => ({id: value.MessageGuid}));
@@ -105,9 +137,9 @@ test('the same reader works on any tenant origin and rejects a tenant switch', a
   await withSAP(async () => json({d: {results: [item('trial-message')]}}), async () => {
     for (const tenant of [TRIAL_TENANT, ...OTHER_TENANTS]) {
       globalThis.location = new URL(tenant);
-      const messages = await readFailedMessages(Date.now(), tenant);
+      const messages = await readNonCompletedMessages(Date.now(), tenant);
       assert.ok(messages[0].url.startsWith(tenant));
-      await assert.rejects(readFailedMessages(Date.now(), TENANT), /left the tenant/);
+      await assert.rejects(readNonCompletedMessages(Date.now(), TENANT), /left the tenant/);
     }
   });
 });
@@ -151,6 +183,28 @@ test('local relay authenticates requests and fixes the recipient', async () => {
     assert.match(sent[0].text, /Status: FAILED/);
     assert.doesNotMatch(sent[0].text, /password|payload/i);
     assert.equal((await request({...failure(), tenant: 'https://example.com'})).status, 400);
+  });
+});
+test('relay emails actual statuses, rejects Completed and malformed statuses, and deduplicates IDs across status changes', async () => {
+  const alert = {...failure(), kind: 'messages'};
+  const statuses = ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED'];
+  alert.messages = statuses.map(status => ({...failure([status]).messages[0], status}));
+  await relayFixture(async ({request, sent}) => {
+    for (const status of ['COMPLETED', 'ALL', undefined, null, '', 'RETRY\nInjected', 42]) {
+      assert.equal((await request({...alert, messages: [{...alert.messages[0], status}]})).status, 400);
+    }
+    assert.equal(sent.length, 0);
+    assert.equal((await request(alert)).status, 200);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].subject, /7 new non-Completed messages/);
+    for (const status of statuses) assert.ok(sent[0].text.includes(`Status: ${status}\n`));
+    const changed = {...alert, messages: [{...alert.messages[2], status: 'FAILED'}, {...failure(['new-id']).messages[0], status: 'RETRY'}]};
+    assert.equal((await request(changed)).status, 200);
+    assert.equal(sent.length, 2);
+    assert.doesNotMatch(sent[1].text, /Message ID: PROCESSING/);
+    assert.match(sent[1].text, /Status: RETRY\n/);
+    assert.equal((await request({...failure(['new-id'])})).status, 200);
+    assert.equal(sent.length, 2); // Legacy and updated senders share per-message receipts.
   });
 });
 test('retries SMTP errors and suppresses duplicate/regrouped sends including persisted receipts', async () => {

@@ -1,9 +1,11 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>IS Message Watchdog</title><link rel="stylesheet" href="popup.css"></head>
 <body><h1>IS Message Watchdog</h1>
-<p>Monitor multiple tenants every minute. Each tenant runs for nine hours and emails new failures.</p>
+<p>Choose which message statuses to email for your selected artifacts. Each tenant is checked every minute for nine hours.</p>
 <label for="token">Local email relay key</label>
 <input id="token" type="password" placeholder="From npm run setup" autocomplete="off">
+<fieldset id="email-statuses" aria-describedby="status-hint"><legend>Email these statuses</legend><div id="status-options"></div></fieldset>
+<p id="status-hint" class="hint">Choose at least one. Completed is always excluded. Changes apply to this tenant when you click Start or Save statuses.</p>
 <div class="actions"><button id="start">Start this tenant</button><button id="test" class="secondary">Send test email</button></div>
 <p id="status" role="status" aria-live="polite">Loading…</p>
 <div id="runs" aria-label="Tenant monitoring runs"></div>

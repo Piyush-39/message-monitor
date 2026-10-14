@@ -117,10 +117,15 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     const base = `http://127.0.0.1:${server.address().port}`;
     h = await backgroundHarness({relayFetch: (url, options) => nativeFetch(`${base}${new URL(url).pathname}`, options)});
     h.tabs.get(1).url += encodeURIComponent(JSON.stringify({artifactIds: ['selected-flow'], packageId: 'selected-package'}));
+    const scoped = (id, status = 'FAILED') => ({...message(id), Status: status, IntegrationArtifact: {Id: 'selected-flow', PackageId: 'selected-package'}});
+    const baseline = scoped('old-processing', 'PROCESSING');
+    h.sap.set(TENANT, [baseline]);
     assert.equal((await h.start()).ok, true);
     assert.equal((await h.start(TRIAL_TENANT)).ok, true);
     h.sap.set(TENANT, [
-      {...message('same-id'), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'selected-package'}},
+      baseline,
+      scoped('same-id'),
+      ...['RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED', 'COMPLETED'].map(status => ({...scoped(status.toLowerCase(), status), LogEnd: null, LogStart: '/Date(1791610000000)/'})),
       {...message('excluded-flow'), IntegrationArtifact: {Id: 'other-flow', PackageId: 'selected-package'}},
       {...message('excluded-package'), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'other-package'}}
     ]);
@@ -131,18 +136,32 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     assert.ok(mails.every(mail => mail.to === 'recipient@gmail.com'));
     assert.ok(mails.some(mail => mail.subject.includes(new URL(TENANT).hostname)));
     assert.ok(mails.some(mail => mail.subject.includes(new URL(TRIAL_TENANT).hostname)));
-    assert.ok(mails.every(mail => /Message ID: same-id/.test(mail.text) && !/excluded-flow|excluded-package/.test(mail.text)));
+    assert.ok(mails.every(mail => /Message ID: same-id/.test(mail.text) && !/excluded-flow|excluded-package|old-processing|Status: COMPLETED/.test(mail.text)));
+    const tenantMail = mails.find(mail => mail.subject.includes(new URL(TENANT).hostname));
+    assert.match(tenantMail.subject, /7 new non-Completed messages/);
+    for (const status of ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED']) assert.ok(tenantMail.text.includes(`Status: ${status}\n`));
+    assert.equal(h.store.state.runs[TENANT].sent, 7);
+    h.sap.set(TENANT, [scoped('processing', 'FAILED'), scoped('completed', 'COMPLETED')]);
+    await h.reload(); await h.poll();
+    assert.equal(mails.length, 2); // Status transitions/restarts do not re-email an observed ID.
+    assert.equal((await h.request('updateStatuses', TENANT, {emailStatuses: ['RETRY']})).ok, true);
+    h.sap.set(TENANT, [scoped('selected-retry', 'RETRY'), scoped('unchecked-failed', 'FAILED'), {...scoped('unchecked-package', 'RETRY'), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'other-package'}}]);
+    await h.reload(); await h.poll(); await h.poll();
+    assert.equal(mails.length, 3);
+    assert.match(mails[2].text, /Status: RETRY\n/);
+    assert.match(mails[2].text, /Message ID: selected-retry/);
+    assert.doesNotMatch(mails[2].text, /unchecked-failed|unchecked-package/);
     h.time += HEARTBEAT_TIMEOUT;
     await server.checkMonitoring(); await server.checkMonitoring();
-    assert.equal(mails.length, 4);
-    assert.ok(mails.slice(2).every(mail => /monitoring stopped/.test(mail.subject)));
+    assert.equal(mails.length, 5);
+    assert.ok(mails.slice(3).every(mail => /monitoring stopped/.test(mail.subject)));
     await h.request('stop', TENANT); await h.request('stop', TRIAL_TENANT);
     const invalid = await nativeFetch(`${base}/monitor`, {method: 'POST', headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify({action: 'start', tenant: 'http://bad.example'})});
     assert.equal(invalid.status, 400);
     const forbidden = await nativeFetch(`${base}/monitor`, {method: 'POST', headers: {Authorization: 'Bearer wrong', 'Content-Type': 'application/json'}, body: '{}'});
     assert.equal(forbidden.status, 401);
     await server.notifyShutdown();
-    assert.equal(mails.length, 4); // Expected Stop disarms shutdown notices too.
+    assert.equal(mails.length, 5); // Expected Stop disarms shutdown notices too.
   } finally {
     if (h) h.close();
     if (server) await new Promise(resolve => server.close(resolve));

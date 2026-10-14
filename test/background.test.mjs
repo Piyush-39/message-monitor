@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {TENANT, TRIAL_TENANT, OTHER_TENANTS} from './fixtures.mjs';
-import {DURATION, POLL_ALARM, END_ALARM, endAlarm} from '../extension/core.js';
+import {DURATION, POLL_ALARM, END_ALARM, endAlarm, EMAIL_STATUSES} from '../extension/core.js';
 import {backgroundHarness, message} from './background-harness.mjs';
 const legacyStart = Date.now();
 
@@ -9,6 +9,48 @@ async function fixture(action, options) {
   const h = await backgroundHarness(options);
   try {await action(h);} finally {h.close();}
 }
+test('status selections persist per tenant, filter baselines and polls, and can change without restarting', () => fixture(async h => {
+  const scoped = (id, status, artifact = 'flow-a') => ({...message(id), Status: status, IntegrationArtifact: {Id: artifact, PackageId: 'package-a'}});
+  h.tabs.get(1).url += encodeURIComponent(JSON.stringify({artifactIds: ['flow-a'], packageId: 'package-a'}));
+  h.sap.set(TENANT, [scoped('old-failed', 'FAILED'), scoped('old-processing', 'PROCESSING')]);
+  assert.equal((await h.request('start', null, {sourceTabId: 1, emailStatuses: ['FAILED', 'RETRY', 'FAILED']})).ok, true);
+  assert.equal((await h.request('start', null, {sourceTabId: 2, emailStatuses: ['ESCALATED']})).ok, true);
+  const original = structuredClone(h.store.state.runs[TENANT]);
+  assert.deepEqual(original.emailStatuses, ['FAILED', 'RETRY']);
+  assert.deepEqual(original.seen, ['old-failed']);
+  h.sap.set(TENANT, [scoped('old-failed', 'FAILED'), scoped('failed', 'FAILED'), scoped('retry', 'RETRY'), scoped('processing', 'PROCESSING'), scoped('wrong-flow', 'FAILED', 'other-flow'), scoped('completed', 'COMPLETED')]);
+  h.sap.set(TRIAL_TENANT, [{...message('escalated'), Status: 'ESCALATED'}, message('ignored')]);
+  await h.reload(); await h.poll();
+  assert.deepEqual(h.delivered.find(alert => alert.tenant === TENANT).messages.map(item => item.id), ['failed', 'retry']);
+  assert.deepEqual(h.delivered.find(alert => alert.tenant === TRIAL_TENANT).messages.map(item => item.id), ['escalated']);
+  const changed = await h.request('updateStatuses', TENANT, {emailStatuses: ['PROCESSING']});
+  assert.equal(changed.ok, true);
+  await h.reload(); await h.poll();
+  assert.deepEqual(h.delivered[2].messages.map(item => item.id), ['processing']);
+  const updated = h.store.state.runs[TENANT];
+  for (const key of ['startedAt', 'endsAt', 'tabId']) assert.equal(updated[key], original[key]);
+  assert.deepEqual(updated.scope, original.scope);
+  assert.deepEqual(updated.emailStatuses, ['PROCESSING']);
+  assert.deepEqual(h.store.state.runs[TRIAL_TENANT].emailStatuses, ['ESCALATED']);
+  assert.ok(h.reads.some(read => new URL(read.url).searchParams.get('$filter').includes("(Status eq 'PROCESSING')")));
+  h.sap.set(TENANT, [scoped('retry', 'PROCESSING')]); // Already emailed under Retry.
+  await h.poll();
+  assert.equal(h.delivered.length, 3);
+}));
+test('empty or invalid status selections do not start a run or change a saved selection', () => fixture(async h => {
+  for (const emailStatuses of [[], null, ['COMPLETED'], ['ALL'], ['FAILED', 'bad'], "FAILED"]) {
+    assert.equal((await h.request('start', null, {sourceTabId: 1, emailStatuses})).ok, false);
+  }
+  assert.equal(h.reads.length, 0);
+  await h.start();
+  const before = structuredClone(h.store.state.runs[TENANT]);
+  for (const emailStatuses of [[], ['COMPLETED'], ['INVALID']]) {
+    assert.equal((await h.request('updateStatuses', TENANT, {emailStatuses})).ok, false);
+    assert.deepEqual(h.store.state.runs[TENANT], before);
+  }
+  assert.deepEqual(before.emailStatuses, EMAIL_STATUSES);
+  assert.equal((await h.request('updateStatuses', TRIAL_TENANT, {emailStatuses: ['FAILED']})).ok, false);
+}));
 test('selected iFlows scope baselines, watchdog URLs and emails independently across tenants and restarts', () => fixture(async h => {
   const selected = (id, artifact, pkg) => ({...message(id), IntegrationArtifact: {Id: artifact, PackageId: pkg, Name: 'Same display name'}});
   for (const [tabId, tenant, artifact, pkg] of [[1, TENANT, 'flow-a', 'package-a'], [2, TRIAL_TENANT, 'flow-b', 'package-b']]) {
@@ -19,7 +61,7 @@ test('selected iFlows scope baselines, watchdog URLs and emails independently ac
     assert.deepEqual(run.scope, {artifactIds: [artifact], packageId: pkg});
     assert.deepEqual(run.seen, ['old-selected']);
     const pageFilter = JSON.parse(decodeURIComponent(h.tabs.get(run.tabId).url.split('/Messages/')[1]));
-    assert.deepEqual(pageFilter, {artifactIds: [artifact], packageId: pkg, time: 'PASTHOUR', status: 'FAILED', edge: 'runtime-a'});
+    assert.deepEqual(pageFilter, {artifactIds: [artifact], packageId: pkg, time: 'PASTHOUR', status: 'ALL', edge: 'runtime-a'});
     // Later edits to the original page must not silently change this run's saved selection.
     h.tabs.get(tabId).url = `${tenant}/shell/monitoring/Messages/`;
     h.sap.set(tenant, [selected('old-selected', artifact, pkg), selected('new-selected', artifact, pkg), selected('new-other', 'other-flow', pkg), selected('wrong-package', artifact, 'other-package')]);
@@ -116,7 +158,7 @@ test('failed email deliveries retry, and missing UI refresh does not disable mon
   assert.equal(h.store.state.runs[TENANT].sent, 1);
   assert.equal(h.store.state.runs[TENANT].tableRefresh, false);
   assert.equal(h.store.state.runs[TENANT].status, 'Watching');
-  assert.equal(h.delivered.filter(alert => alert.kind === 'failures').length, 1);
+  assert.equal(h.delivered.filter(alert => alert.kind === 'messages').length, 1);
 }));
 test('missing permissions prevent start and revocation alerts only the affected tenant', () => fixture(async h => {
   h.denied.add(TENANT);
@@ -142,6 +184,7 @@ test('migrates the legacy run and restores tenant alarms after worker restart', 
   assert.equal(h.store.state.version, 2);
   assert.equal(h.store.state.runs[TENANT].sent, 7);
   assert.deepEqual(h.store.state.runs[TENANT].seen, ['already-sent']);
+  assert.deepEqual((await h.request('status')).value.runs[0].emailStatuses, EMAIL_STATUSES);
   assert.equal(h.alarms.has(END_ALARM), false);
   await h.start(TRIAL_TENANT);
   h.alarms.clear();

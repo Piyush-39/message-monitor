@@ -26,6 +26,7 @@ export function validateAlert(value) {
     }
     if (typeof message.id !== 'string' || !/^[\w-]{1,200}$/.test(message.id)) throw new Error('Invalid message ID');
     if (typeof message.flow !== 'string' || message.flow.length > 300 || typeof message.time !== 'string' || message.time.length > 50) throw new Error('Invalid message');
+    if (message.errorText !== undefined && (typeof message.errorText !== 'string' || message.errorText.length > 2000)) throw new Error('Invalid error details');
     const url = new URL(message.url);
     if (url.origin !== value.tenant || url.username || url.password || !url.pathname.startsWith('/shell/monitoring/Messages/')) throw new Error('Invalid message link');
   }
@@ -48,10 +49,11 @@ export function composeEmail(alert) {
   };
   return {
     subject: `IS Watchdog: ${alert.messages.length} new non-Completed message${alert.messages.length === 1 ? '' : 's'} — ${new URL(alert.tenant).hostname}`,
-    text: alert.messages.map(message => `Status: ${message.status ?? 'FAILED'}\nFlow: ${message.flow}\nMessage ID: ${message.id}\nTime: ${message.time || 'Unavailable'}\nOpen: ${message.url}`).join('\n\n')
+    text: alert.messages.map(message => `Status: ${message.status ?? 'FAILED'}\nFlow: ${message.flow}\nMessage ID: ${message.id}\nTime: ${message.time || 'Unavailable'}\nError: ${message.errorText || 'Error details unavailable. Open the message in IS for details.'}\nOpen: ${message.url}`).join('\n\n')
   };
 }
-async function jsonBody(request, limit = 100000) {
+// Allow 50 bounded error excerpts, including multibyte or JSON-escaped text.
+async function jsonBody(request, limit = 1000000) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {

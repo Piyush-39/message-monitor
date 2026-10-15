@@ -90,3 +90,58 @@ export async function readNonCompletedMessages(since, expectedOrigin, scope = {}
   }
   return messages;
 }
+
+// Serialized independently into the SAP tab; only enrich an unseen email batch.
+export async function readMessageErrors(messages, expectedOrigin) {
+  if (location.origin !== expectedOrigin || !/^\/shell\/monitoring\/Messages(?:\/|$)/.test(location.pathname)) throw new Error('SAP tab has left the monitor page.');
+  if (!Array.isArray(messages) || !messages.length || messages.length > 50 ||
+      messages.some(message => typeof message?.id !== 'string' || !/^[\w-]{1,200}$/.test(message.id) || message.status === 'COMPLETED')) throw new Error('Invalid error detail batch.');
+  const limit = 2000;
+  const deadline = Date.now() + 15000;
+  const unavailable = 'Error details unavailable. Open the message in IS for details.';
+  const absent = 'No error information available.';
+  const errors = Array(messages.length).fill(unavailable);
+  let next = 0;
+  async function worker() {
+    while (next < messages.length) {
+      const index = next++;
+      const message = messages[index];
+      // SAP documents that Discarded messages have no error information.
+      if (message.status === 'DISCARDED') {errors[index] = absent; continue;}
+      if (Date.now() >= deadline) continue;
+      const url = new URL(`/odata/api/v1/MessageProcessingLogs('${message.id}')/ErrorInformation/$value`, expectedOrigin);
+      try {
+        const response = await fetch(url.href, {
+          credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+          headers: {Accept: 'text/plain, application/octet-stream'},
+          signal: AbortSignal.timeout(Math.max(1, Math.min(5000, deadline - Date.now())))
+        });
+        const contentType = response.headers.get('content-type') || '';
+        if (!response.ok || /text\/html/i.test(contentType) || response.status === 204) {
+          if (response.status === 404 || response.status === 204) errors[index] = absent;
+          await response.body?.cancel();
+          continue;
+        }
+        // Read only the start of potentially large exception streams.
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        let text = '';
+        if (reader) {
+          try {
+            while (text.length <= limit) {
+              const {value, done} = await reader.read();
+              if (done) {text += decoder.decode(); break;}
+              text += decoder.decode(value, {stream: true});
+            }
+          } finally {await reader.cancel();}
+        }
+        if (/^\s*(?:<!doctype\s+html|<html[\s>])/i.test(text)) continue;
+        text = text.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
+        const marker = '\n[truncated]';
+        errors[index] = text.length > limit ? text.slice(0, limit - marker.length) + marker : text || absent;
+      } catch { /* Details are best-effort; a failed lookup must not suppress the alert. */ }
+    }
+  }
+  await Promise.all(Array.from({length: Math.min(5, messages.length)}, () => worker()));
+  return errors;
+}

@@ -120,8 +120,12 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     const scoped = (id, status = 'FAILED') => ({...message(id), Status: status, IntegrationArtifact: {Id: 'selected-flow', PackageId: 'selected-package'}});
     const baseline = scoped('old-processing', 'PROCESSING');
     h.sap.set(TENANT, [baseline]);
+    h.sapErrors.set(`${TENANT}:same-id`, 'Receiver HTTP 500: Order service unavailable\nCaused by: connection refused');
+    h.sapErrors.set(`${TRIAL_TENANT}:same-id`, 'Trial tenant receiver authentication failed');
+    h.sapErrors.set(`${TENANT}:retry`, new Response('Error service down', {status: 500}));
     assert.equal((await h.start()).ok, true);
     assert.equal((await h.start(TRIAL_TENANT)).ok, true);
+    assert.equal(h.errorReads.length, 0); // Baselines do not fetch exception details.
     h.sap.set(TENANT, [
       baseline,
       scoped('same-id'),
@@ -139,11 +143,19 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     assert.ok(mails.every(mail => /Message ID: same-id/.test(mail.text) && !/excluded-flow|excluded-package|old-processing|Status: COMPLETED/.test(mail.text)));
     const tenantMail = mails.find(mail => mail.subject.includes(new URL(TENANT).hostname));
     assert.match(tenantMail.subject, /7 new non-Completed messages/);
+    assert.match(tenantMail.text, /Error: Receiver HTTP 500: Order service unavailable\nCaused by: connection refused/);
+    assert.match(tenantMail.text, /Error: Error details unavailable\./);
+    assert.match(tenantMail.text, /Error: No error information available\./);
+    assert.doesNotMatch(tenantMail.text, /Trial tenant receiver|Error service down/);
+    assert.match(mails.find(mail => mail !== tenantMail).text, /Error: Trial tenant receiver authentication failed/);
+    assert.equal(h.errorReads.length, 7);
+    assert.ok(h.errorReads.every(read => !['old-processing', 'excluded-flow', 'excluded-package', 'completed', 'discarded'].includes(read.id)));
     for (const status of ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED']) assert.ok(tenantMail.text.includes(`Status: ${status}\n`));
     assert.equal(h.store.state.runs[TENANT].sent, 7);
     h.sap.set(TENANT, [scoped('processing', 'FAILED'), scoped('completed', 'COMPLETED')]);
     await h.reload(); await h.poll();
     assert.equal(mails.length, 2); // Status transitions/restarts do not re-email an observed ID.
+    assert.equal(h.errorReads.length, 7); // Previously seen IDs are not enriched again either.
     assert.equal((await h.request('updateStatuses', TENANT, {emailStatuses: ['RETRY']})).ok, true);
     h.sap.set(TENANT, [scoped('selected-retry', 'RETRY'), scoped('unchecked-failed', 'FAILED'), {...scoped('unchecked-package', 'RETRY'), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'other-package'}}]);
     await h.reload(); await h.poll(); await h.poll();

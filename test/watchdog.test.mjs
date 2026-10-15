@@ -207,6 +207,25 @@ test('relay emails actual statuses, rejects Completed and malformed statuses, an
     assert.equal(sent.length, 2); // Legacy and updated senders share per-message receipts.
   });
 });
+test('relay validates error excerpts and accepts a full batch of 2000-character Unicode errors', async () => {
+  await relayFixture(async ({request, sent}) => {
+    for (const errorText of [null, 42, {}, 'x'.repeat(2001)]) {
+      const alert = failure();
+      alert.messages[0].errorText = errorText;
+      assert.equal((await request(alert)).status, 400);
+    }
+    assert.equal(sent.length, 0);
+    const alert = {...failure(Array.from({length: 50}, (_, index) => `message-${index}`)), kind: 'messages'};
+    alert.messages = alert.messages.map(message => ({...message, status: 'FAILED', errorText: '😀'.repeat(1000)}));
+    assert.ok(Buffer.byteLength(JSON.stringify(alert)) > 100000);
+    assert.equal((await request(alert)).status, 200);
+    assert.equal(sent.length, 1);
+    assert.equal((sent[0].text.match(/Error: /g) || []).length, 50);
+    assert.ok(sent[0].text.includes('😀'.repeat(1000)));
+    assert.equal((await request(alert)).status, 200);
+    assert.equal(sent.length, 1);
+  });
+});
 test('retries SMTP errors and suppresses duplicate/regrouped sends including persisted receipts', async () => {
   let attempts = 0;
   const mails = [];

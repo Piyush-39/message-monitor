@@ -160,6 +160,18 @@ test('failed email deliveries retry, and missing UI refresh does not disable mon
   assert.equal(h.store.state.runs[TENANT].status, 'Watching');
   assert.equal(h.delivered.filter(alert => alert.kind === 'messages').length, 1);
 }));
+test('a tab lost between listing and error lookup still emails the detected message with a fallback', () => fixture(async h => {
+  await h.start();
+  h.sap.set(TENANT, () => {
+    h.tabs.delete(h.store.state.runs[TENANT].tabId);
+    return [message('detected-before-close')];
+  });
+  await h.poll();
+  assert.equal(h.delivered.length, 1);
+  assert.equal(h.delivered[0].messages[0].id, 'detected-before-close');
+  assert.match(h.delivered[0].messages[0].errorText, /^Error details unavailable\./);
+  assert.deepEqual(h.store.state.runs[TENANT].seen, ['detected-before-close']);
+}));
 test('missing permissions prevent start and revocation alerts only the affected tenant', () => fixture(async h => {
   h.denied.add(TENANT);
   assert.equal((await h.start()).ok, false);

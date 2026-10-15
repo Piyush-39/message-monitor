@@ -40,7 +40,7 @@ Each run captures the applied page's selected technical iFlow IDs (`artifactIds`
 
 Email detection makes a fresh SAP request every minute and does not depend on the displayed table or manually clicking Refresh. The extension also invokes **Reload content** through the button's SAP UI5 press handler in the dedicated tab's Messages toolbar after each successful check, keeping that table current. A plain DOM click does not trigger this handler on the observed monitor; the extension uses the registered `sap.m.Button.firePress()` event ([SAP UI5 API](https://ui5.github.io/typescript/api/sapui5/1.148/sap.m/sap/m/Button/classes/Button.html)). Other open monitor tabs are not refreshed. The popup shows the last table-refresh time; if SAP changes its toolbar or the button is unavailable, email checks continue and the popup reports that table refresh is unavailable.
 
-Existing messages matching the selected statuses are recorded as a baseline and do not trigger emails. New messages matching the selected statuses are grouped into emails with up to 50 messages, including actual status, flow name, message ID, time and a link to IS. Payloads and detailed exception text are not emailed. Successfully emailed message IDs are deduplicated across checks; the local relay also persists delivery receipts for 30 days. Failed email attempts retry on subsequent checks.
+Existing messages matching the selected statuses are recorded as a baseline and do not trigger emails. New messages matching the selected statuses are grouped into emails with up to 50 messages, including actual status, flow name, message ID, time, error text and a link to IS. Error text is fetched from the message’s `ErrorInformation/$value` endpoint using the same tenant session. Message payload and attachment endpoints are not read. Successfully emailed message IDs are deduplicated across checks; the local relay also persists delivery receipts for 30 days. Failed email attempts retry on subsequent checks.
 
 The popup shows each tenant's status, last successful SAP check, table-refresh time, sent-message count and end time. Email subjects identify the tenant. **Stop** ends the selected tenant's run; the run also stops automatically after nine hours. The dedicated tab stays open. Starting another run creates a fresh tab; old watchdog tabs can be closed after stopping. A check has a 20-second / 200-page budget; unusually high message volume is reported as a monitoring problem rather than silently truncated.
 
@@ -64,6 +64,12 @@ On a normal relay shutdown (`SIGINT`/`SIGTERM`, including Ctrl+C), the relay att
 
 A relay that is force-killed, an offline computer, or an unavailable Gmail connection cannot send an immediate email. Such gaps are reported after the relay/network recovers; truly immediate detection while the whole computer is offline needs an external monitor. Long Chrome alarm delays can also trigger the three-minute warning.
 
+## Error text in emails
+
+Each new alert includes an **Error** field containing up to 2,000 characters of SAP error information. Longer errors end with `[truncated]`; open the message link for the full details. No error lookups are made for baseline messages, previously emailed IDs, unchecked statuses or artifacts outside the run’s saved selection.
+
+If SAP returns no error information, the email says **No error information available**. A failed lookup, expired detail request or unavailable watchdog tab produces **Error details unavailable** while the message alert still sends. Detail lookups use up to five concurrent requests and a 15-second budget per email batch. [Discarded messages have no error information according to SAP](https://help.sap.com/docs/integration-suite/isuite-integrations-and-apis/message-processing-logs), so their detail requests are skipped.
+
 ## Choose email statuses
 
 The popup offers **Failed**, **Retry**, **Processing**, **Escalated**, **Cancelled**, **Discarded** and **Abandoned** checkboxes. All seven are selected by default; Completed is always excluded. Select at least one before starting. Each tenant saves its own selection, and each card shows its email statuses.
@@ -71,6 +77,10 @@ The popup offers **Failed**, **Retry**, **Processing**, **Escalated**, **Cancell
 To change an active tenant, open its monitor or watchdog tab and reopen the popup. Its saved checkboxes load automatically. Change them and click **Save statuses**. The selection takes effect on the next check without restarting the run or changing its saved artifact/package filters, end time or duplicate tracking. Other tenants keep their selections. Saved selections survive Chrome/worker restarts and load again when starting that tenant later.
 
 Enabling another status can email previously unseen messages in that status within the run’s scan window. A message ID already recorded in the baseline or successfully emailed is still suppressed, even if it changes status.
+
+## Upgrade to version 1.5.0
+
+Restart the relay with `npm start`, then reload the extension in `chrome://extensions`. New alert emails include error details automatically; existing tenant runs and saved status/artifact selections continue. Previously emailed messages are not resent.
 
 ## Upgrade to version 1.4.0
 
@@ -92,7 +102,7 @@ For the **1.1.1 iFlow filter fix**, reload the extension, Stop any existing run 
 npm test
 ```
 
-Automated tests cover per-tenant status selections, live selection updates, persistence, invalid/empty selections, simultaneous tenants with matching message IDs, selected artifact/package baselines and polls, exact IDs despite identical display names, OData escaping, pagination filtering, malformed filters, independent Stop/expiry, slow or failed tenants, permission denial/revocation, worker restart and legacy state migration, missing table refresh, and persisted delivery receipts. An end-to-end test runs the actual serialized page reader against fake SAP responses, sends requests through the real authenticated HTTP relay, and checks mail delivery with a fake SMTP transport, including exclusion of unselected iFlows. Tests do not create SAP messages or send real Gmail email.
+Automated tests cover error-text lookup and email delivery, absent/unavailable details, long UTF-8 errors, bounded concurrency, full email batches, per-tenant status selections, live selection updates, persistence, invalid/empty selections, simultaneous tenants with matching message IDs, selected artifact/package baselines and polls, exact IDs despite identical display names, OData escaping, pagination filtering, malformed filters, independent Stop/expiry, slow or failed tenants, permission denial/revocation, worker restart and legacy state migration, missing table refresh, and persisted delivery receipts. An end-to-end test runs the actual serialized page reader against fake SAP responses, sends requests through the real authenticated HTTP relay, and checks mail delivery with a fake SMTP transport, including exclusion of unselected iFlows. Tests do not create SAP messages or send real Gmail email.
 
 
 Earlier versions were validated live on the trial tenant, including successful failure emails and automatic SAP table refresh. Version 1.1.1's artifact and package query was also checked read-only against an authenticated tenant: HTTP 200 with a result matching both selected IDs. Filtered email delivery, concurrent tenant and outage behavior are covered by automated tests; simultaneous live tenant sessions and a full nine-hour shift still need live validation.

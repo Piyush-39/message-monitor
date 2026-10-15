@@ -12,6 +12,8 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
   const store = saved ? {state: structuredClone(saved)} : {};
   const tabs = new Map([[1, {id: 1, url: `${TENANT}/shell/monitoring/Messages/`}], [2, {id: 2, url: `${TRIAL_TENANT}/shell/monitoring/Messages/` }]]);
   const sap = new Map();
+  const sapErrors = new Map();
+  const errorReads = [];
   const broken = new Set();
   const denied = new Set();
   const alarms = new Map();
@@ -41,8 +43,15 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
       const location = new URL(tabs.get(target.tabId).url);
       const tenant = location.origin;
       // Separate page globals reproduce MAIN-world scripts running in different tabs concurrently.
-      const context = {args, URL, Date, AbortSignal, location,
+      const context = {args, URL, Date, AbortSignal, TextDecoder, location,
         fetch: async (url, options) => {
+          const errorMatch = /^\/odata\/api\/v1\/MessageProcessingLogs\('([\w-]+)'\)\/ErrorInformation\/\$value$/.exec(new URL(url).pathname);
+          if (errorMatch) {
+            errorReads.push({tenant, id: errorMatch[1], url: String(url), options});
+            const value = sapErrors.get(`${tenant}:${errorMatch[1]}`);
+            const response = typeof value === 'function' ? await value(url, options) : value;
+            return response instanceof Response ? response : response === undefined ? new Response(null, {status: 404}) : new Response(response, {headers: {'content-type': 'text/plain'}});
+          }
           reads.push({tenant, url: String(url), options});
           if (broken.has(tenant)) return new Response('Login', {headers: {'content-type': 'text/html'}});
           const records = sap.get(tenant);
@@ -97,7 +106,7 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
   }
   await reload();
   return {
-    store, tabs, sap, broken, denied, alarms, delivered, monitoring, notices, tableClicks, reads, request, reload,
+    store, tabs, sap, sapErrors, broken, denied, alarms, delivered, monitoring, notices, tableClicks, reads, errorReads, request, reload,
     set time(value) {clock = value;}, get time() {return clock;}, get awake() {return keepAwake;},
     set emailBroken(value) {emailBroken = value;}, set monitorBroken(value) {monitorBroken = value;},
     set refreshAvailable(value) {refreshAvailable = value;},

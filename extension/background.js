@@ -1,5 +1,5 @@
 import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, emailStatuses, DURATION, POLL_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
-import { readNonCompletedMessages, refreshMessageTable } from './poll.js';
+import { readNonCompletedMessages, readMessageErrors, refreshMessageTable } from './poll.js';
 
 const RELAY = 'http://127.0.0.1:43171';
 let state;
@@ -48,6 +48,17 @@ async function read(run, since) {
   const result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readNonCompletedMessages, args: [since, tenant, run.scope || {}, emailStatuses(run.emailStatuses)]});
   if (!Array.isArray(result[0]?.result)) throw new Error(result[0]?.error?.message || 'SAP check failed. Sign in again if the tab shows a login page.');
   return result[0].result;
+}
+async function withErrorDetails(run, messages) {
+  let errors;
+  try {
+    const result = await chrome.scripting.executeScript({target: {tabId: run.tabId}, world: 'MAIN', func: readMessageErrors,
+      args: [messages.map(({id, status}) => ({id, status})), run.tenant]});
+    const values = result[0]?.result;
+    if (Array.isArray(values) && values.length === messages.length && values.every(value => typeof value === 'string' && value.length <= 2000)) errors = values;
+  } catch { /* A missing detail response must not block the message email. */ }
+  return messages.map((message, index) => ({...message,
+    errorText: errors?.[index] || 'Error details unavailable. Open the message in IS for details.'}));
 }
 async function updateControls() {
   const active = Object.values(state.runs).filter(run => activeRun(run));
@@ -119,7 +130,8 @@ async function tick(run) {
     run.lastCheck = Date.now();
     for (let fresh = unseenMessages(messages, run.seen), offset = 0; offset < fresh.length; offset += 50) {
       if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
-      const batch = fresh.slice(offset, offset + 50);
+      const batch = await withErrorDetails(run, fresh.slice(offset, offset + 50));
+      if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
       await relay('/alert', run.token, {kind: 'messages', run: run.startedAt, tenant: run.tenant, messages: batch});
       run.seen.push(...batch.map(message => message.id));
       run.sent += batch.length;

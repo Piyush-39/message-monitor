@@ -141,7 +141,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
 }
 async function main() {
   const {SMTP_USER: user, SMTP_PASS: pass, ALERT_TO: recipient = user, RELAY_TOKEN: token} = process.env;
-  if (!pass || !/^[a-zA-Z0-9]{16}$/.test(pass.replace(/\s/g, ''))) throw new Error('Run npm run setup and supply a Gmail app password.');
+  if (!pass || !/^[a-zA-Z0-9]{16}$/.test(pass.replace(/\s/g, ''))) throw new Error('Set SMTP_PASS in .env to your 16-character Gmail app password.');
   const transport = nodemailer.createTransport({
     host: 'smtp.gmail.com', port: 465, secure: true,
     auth: {user, pass: pass.replace(/\s/g, '')},

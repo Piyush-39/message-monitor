@@ -16,7 +16,7 @@ npm run setup
 npm start
 ```
 
-Setup defaults to sending from and to **piyushsahu9846@gmail.com**. Enter the Gmail app password in your own terminal; input is hidden. Setup writes a private `.env` and prints a separate relay key for the extension. Run `npm start` in your own Terminal and keep it running for the monitoring shift; a process started by an agent can be cancelled when its tool server restarts. The relay verifies Gmail authentication before it starts.
+Your local `.env` already contains the email settings. `npm run setup` reads it and prints only the relay key for the extension, without asking for credentials or changing the email settings. It reuses the saved key; if one is missing, it generates and saves one. For a new installation, copy `.env.example` to `.env` and fill in the email settings there first. `npm start` automatically loads `.env`; keep it running in your own Terminal for the monitoring shift, since a process started by an agent can be cancelled when its tool server restarts. The relay verifies Gmail authentication before it starts.
 
 The current local configuration sends from **piyushsahu9846@gmail.com** to **piyushsahu731@gmail.com**. The local `.env` is not included in the ZIP.
 

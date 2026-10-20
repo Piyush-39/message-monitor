@@ -62,6 +62,37 @@ test('Discord cards fit API limits, keep iFlow and status prominent, disable men
   assert.throws(() => discordMessage({...original, messages: [...original.messages, ...original.messages]}), /one SAP message/);
 });
 
+test('Discord notification summaries preserve iFlow names without added Markdown or escape slashes', () => {
+  const original = alert('preview');
+  original.messages[0].status = 'PROCESSING';
+  original.messages[0].flow = 'IF_12000_01_LP1_PEAK_SIEMEDTD_GSMS_CLOSE_ESCAL_Sync';
+  const payload = discordMessage(original);
+  assert.equal(payload.content, `[PROCESSING] ${original.messages[0].flow}`);
+  assert.ok(!payload.content.includes('\\'));
+  assert.ok(!payload.content.includes('**'));
+  // The in-app card still escapes Markdown and all content remains mention-safe.
+  assert.ok(payload.embeds[0].description.includes('IF\\_12000'));
+  original.messages[0].flow = '@everyone ' + '_'.repeat(290);
+  const mentions = discordMessage(original);
+  assert.deepEqual(mentions.allowed_mentions, {parse: []});
+  assert.ok(mentions.content.length <= 2000);
+  original.messages[0].flow = '';
+  assert.equal(discordMessage(original).content, '[PROCESSING] Unknown iFlow');
+});
+
+test('Discord message times use IST including date rollover and unavailable timestamps', () => {
+  const original = alert('time');
+  const displayedTime = time => {
+    original.messages[0].time = time;
+    return discordMessage(original).embeds[0].fields.find(field => field.name === 'Time').value;
+  };
+  assert.equal(displayedTime('2026-10-20T15:47:12.121Z'), '20 Oct 2026, 21:17:12 IST');
+  assert.equal(displayedTime('2026-12-31T20:45:00Z'), '1 Jan 2027, 02:15:00 IST');
+  assert.equal(displayedTime('2026-10-20T21:17:12+05:30'), '20 Oct 2026, 21:17:12 IST');
+  assert.equal(displayedTime(''), 'Unavailable');
+  assert.equal(displayedTime('Unavailable'), 'Unavailable');
+});
+
 test('queued alerts are saved before acknowledgment, survive restart, deduplicate retries and keep matching IDs tenant-scoped', () => fixture(async f => {
   assert.equal((await f.delivery.enqueue(alert('same'))).queued, true);
   assert.equal((await f.delivery.enqueue(alert('same'))).duplicate, true);
@@ -208,7 +239,8 @@ test('extension → authenticated relay → saved Discord outbox → one alerts 
     const base = `http://127.0.0.1:${server.address().port}`;
     h = await backgroundHarness({relayFetch: (url, options) => nativeFetch(`${base}${new URL(url).pathname}`, options)});
     await h.start();
-    h.sap.set(TENANT, [message('redirect'), message('unrelated'), {...message('discarded'), Status: 'DISCARDED'}]);
+    h.sap.set(TENANT, [message('redirect'), message('unrelated'), {...message('discarded'), Status: 'DISCARDED'}]
+      .map(item => ({...item, IntegrationFlowName: 'IF_Orders_Process'})));
     h.sapErrors.set(`${TENANT}:redirect`, 'HTTP operation failed with statusCode: 302');
     h.sapErrors.set(`${TENANT}:unrelated`, 'Receiver service unavailable');
     await h.poll(); await h.poll();
@@ -222,6 +254,8 @@ test('extension → authenticated relay → saved Discord outbox → one alerts 
     await delivery.flush(); h.time += 100; await delivery.flush(); h.time += 100; await delivery.flush();
     assert.equal(sent.length, 3);
     assert.ok(sent.every(item => item.url.startsWith(webhook) && item.body.flags === 0));
+    assert.deepEqual(sent.map(item => item.body.content), ['[FAILED] IF_Orders_Process', '[FAILED] IF_Orders_Process', '[DISCARDED] IF_Orders_Process']);
+    assert.ok(sent.every(item => item.body.embeds[0].fields.find(field => field.name === 'Time').value.endsWith(' IST')));
     assert.ok(sent.some(item => item.body.embeds[0].description.includes('statusCode: 302')));
     assert.ok(sent.some(item => item.body.embeds[0].description.includes('Receiver service unavailable')));
     h.time += HEARTBEAT_TIMEOUT;

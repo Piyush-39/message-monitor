@@ -34,6 +34,10 @@ For reviewing an alert and then creating or editing rules for future matching al
 
 Each SAP message becomes its own card with a prominent status, full iFlow name, tenant, message ID, time, error excerpt and a clickable title linking to that SAP message. Mentions are disabled so error text cannot trigger `@everyone`, user or role pings. All cards are ordinary notifications, regardless of HTTP error code. Notification display is controlled by your Discord and device settings.
 
+Message times in Discord cards use **IST (Asia/Kolkata)**, for example `20 Oct 2026, 21:17:12 IST`. Each message also includes a plain-text `[STATUS] iFlow_name` summary for notification previews. This preserves the original underscores without adding the Markdown escape backslashes that iPhone previews can expose from an embed. Long names can still be shortened by the phone's notification layout; open the card for the full name and details.
+
+Restart the relay (Ctrl+C, then `npm start`) to apply this formatting to newly queued alerts; no extension reload is needed. Already queued or delivered cards retain their saved format.
+
 You can also configure manually using `.env.example`:
 
 ```dotenv

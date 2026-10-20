@@ -3,6 +3,14 @@ import {readFile, writeFile, rename} from 'node:fs/promises';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const safeText = value => String(value).replace(/([\\`*_~|>\[\]])/g, '\\$1');
+const istTime = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'medium', hourCycle: 'h23'
+});
+function messageTime(value) {
+  if (!value) return 'Unavailable';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : `${istTime.format(date)} IST`;
+}
 export function webhookURL(value) {
   let url;
   try {url = new URL(value);} catch {throw new Error('Enter a valid Discord webhook URL.');}
@@ -28,9 +36,12 @@ export function discordMessage(alert) {
   const isMessage = ['messages', 'failures'].includes(alert.kind);
   if (isMessage && alert.messages.length !== 1) throw new Error('Send one SAP message per Discord alert.');
   const message = isMessage ? alert.messages[0] : null;
-  let embed;
+  let embed, content;
   if (message) {
     const status = message.status ?? 'FAILED';
+    // Mobile push previews can expose the embed's raw Markdown escapes. Give
+    // Discord a separate summary with the original name and no added markup.
+    content = `[${status}] ${message.flow || 'Unknown iFlow'}`;
     embed = {
       title: `IS Watchdog · ${status}`,
       description: `**iFlow**\n${safeText(message.flow || 'Unknown iFlow')}\n\n**Error details**\n${safeText(message.errorText || 'Error details unavailable. Open the message in SAP IS.')}`.slice(0, 4096),
@@ -39,7 +50,7 @@ export function discordMessage(alert) {
       fields: [
         {name: 'Tenant', value: safeText(new URL(alert.tenant).hostname)},
         {name: 'Message ID', value: safeText(message.id)},
-        {name: 'Time', value: safeText(message.time || 'Unavailable')}
+        {name: 'Time', value: safeText(messageTime(message.time))}
       ],
       footer: {text: 'Open the title to view this message in SAP IS'}
     };
@@ -49,7 +60,7 @@ export function discordMessage(alert) {
       description: alert.kind === 'test' ? 'Discord delivery is working. SAP alerts will show their status, iFlow, error details and SAP link here.' : safeText(alert.problem),
       ...(alert.tenant ? {fields: [{name: 'Tenant', value: safeText(new URL(alert.tenant).hostname)}]} : {})};
   }
-  return {username: 'IS Watchdog', allowed_mentions: {parse: []}, flags: 0, embeds: [embed]};
+  return {username: 'IS Watchdog', allowed_mentions: {parse: []}, flags: 0, ...(content ? {content} : {}), embeds: [embed]};
 }
 const deliveryKey = alert => hash(JSON.stringify(['discord', alert.kind, alert.tenant,
   ['messages', 'failures'].includes(alert.kind) ? alert.messages[0].id : alert.kind === 'test' ? alert.nonce : [alert.run, alert.episode]]));

@@ -136,44 +136,47 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     h.sap.set(TRIAL_TENANT, [message('same-id')]);
     h.time += 60000;
     await h.poll(); await h.poll();
-    assert.equal(mails.length, 2);
+    assert.equal(mails.length, 8);
     assert.ok(mails.every(mail => mail.to === 'recipient@gmail.com'));
     assert.ok(mails.some(mail => mail.subject.includes(new URL(TENANT).hostname)));
     assert.ok(mails.some(mail => mail.subject.includes(new URL(TRIAL_TENANT).hostname)));
-    assert.ok(mails.every(mail => /Message ID: same-id/.test(mail.text) && !/excluded-flow|excluded-package|old-processing|Status: COMPLETED/.test(mail.text)));
-    const tenantMail = mails.find(mail => mail.subject.includes(new URL(TENANT).hostname));
-    assert.match(tenantMail.subject, /7 new non-Completed messages/);
+    assert.ok(mails.every(mail => (mail.text.match(/Message ID: /g) || []).length === 1 && !/excluded-flow|excluded-package|old-processing|Status: COMPLETED/.test(mail.text)));
+    assert.equal(new Set(mails.map(mail => mail.subject)).size, 8);
+    const tenantMails = mails.filter(mail => mail.subject.includes(new URL(TENANT).hostname));
+    assert.equal(tenantMails.length, 7);
+    const tenantMail = tenantMails.find(mail => mail.text.includes('Message ID: same-id\n'));
+    assert.match(tenantMail.subject, /1 new non-Completed message/);
     assert.match(tenantMail.text, /Error: Receiver HTTP 500: Order service unavailable\nCaused by: connection refused/);
-    assert.match(tenantMail.text, /Error: Error details unavailable\./);
-    assert.match(tenantMail.text, /Error: No error information available\./);
+    assert.ok(tenantMails.some(mail => /Error: Error details unavailable\./.test(mail.text)));
+    assert.ok(tenantMails.some(mail => /Error: No error information available\./.test(mail.text)));
     assert.doesNotMatch(tenantMail.text, /Trial tenant receiver|Error service down/);
-    assert.match(mails.find(mail => mail !== tenantMail).text, /Error: Trial tenant receiver authentication failed/);
+    assert.match(mails.find(mail => mail.subject.includes(new URL(TRIAL_TENANT).hostname)).text, /Error: Trial tenant receiver authentication failed/);
     assert.equal(h.errorReads.length, 7);
     assert.ok(h.errorReads.every(read => !['old-processing', 'excluded-flow', 'excluded-package', 'completed', 'discarded'].includes(read.id)));
-    for (const status of ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED']) assert.ok(tenantMail.text.includes(`Status: ${status}\n`));
+    for (const status of ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED']) assert.ok(tenantMails.some(mail => mail.text.includes(`Status: ${status}\n`)));
     assert.equal(h.store.state.runs[TENANT].sent, 7);
     h.sap.set(TENANT, [scoped('processing', 'FAILED'), scoped('completed', 'COMPLETED')]);
     await h.reload(); await h.poll();
-    assert.equal(mails.length, 2); // Status transitions/restarts do not re-email an observed ID.
+    assert.equal(mails.length, 8); // Status transitions/restarts do not re-email an observed ID.
     assert.equal(h.errorReads.length, 7); // Previously seen IDs are not enriched again either.
     assert.equal((await h.request('updateStatuses', TENANT, {emailStatuses: ['RETRY']})).ok, true);
     h.sap.set(TENANT, [scoped('selected-retry', 'RETRY'), scoped('unchecked-failed', 'FAILED'), {...scoped('unchecked-package', 'RETRY'), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'other-package'}}]);
     await h.reload(); await h.poll(); await h.poll();
-    assert.equal(mails.length, 3);
-    assert.match(mails[2].text, /Status: RETRY\n/);
-    assert.match(mails[2].text, /Message ID: selected-retry/);
-    assert.doesNotMatch(mails[2].text, /unchecked-failed|unchecked-package/);
+    assert.equal(mails.length, 9);
+    assert.match(mails[8].text, /Status: RETRY\n/);
+    assert.match(mails[8].text, /Message ID: selected-retry/);
+    assert.doesNotMatch(mails[8].text, /unchecked-failed|unchecked-package/);
     h.time += HEARTBEAT_TIMEOUT;
     await server.checkMonitoring(); await server.checkMonitoring();
-    assert.equal(mails.length, 5);
-    assert.ok(mails.slice(3).every(mail => /monitoring stopped/.test(mail.subject)));
+    assert.equal(mails.length, 11);
+    assert.ok(mails.slice(9).every(mail => /monitoring stopped/.test(mail.subject)));
     await h.request('stop', TENANT); await h.request('stop', TRIAL_TENANT);
     const invalid = await nativeFetch(`${base}/monitor`, {method: 'POST', headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify({action: 'start', tenant: 'http://bad.example'})});
     assert.equal(invalid.status, 400);
     const forbidden = await nativeFetch(`${base}/monitor`, {method: 'POST', headers: {Authorization: 'Bearer wrong', 'Content-Type': 'application/json'}, body: '{}'});
     assert.equal(forbidden.status, 401);
     await server.notifyShutdown();
-    assert.equal(mails.length, 5); // Expected Stop disarms shutdown notices too.
+    assert.equal(mails.length, 11); // Expected Stop disarms shutdown notices too.
   } finally {
     if (h) h.close();
     if (server) await new Promise(resolve => server.close(resolve));

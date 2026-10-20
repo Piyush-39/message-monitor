@@ -195,16 +195,16 @@ test('relay emails actual statuses, rejects Completed and malformed statuses, an
     }
     assert.equal(sent.length, 0);
     assert.equal((await request(alert)).status, 200);
-    assert.equal(sent.length, 1);
-    assert.match(sent[0].subject, /7 new non-Completed messages/);
-    for (const status of statuses) assert.ok(sent[0].text.includes(`Status: ${status}\n`));
+    assert.equal(sent.length, 7);
+    assert.ok(sent.every(mail => /1 new non-Completed message/.test(mail.subject)));
+    for (const status of statuses) assert.ok(sent.some(mail => mail.text.includes(`Status: ${status}\n`)));
     const changed = {...alert, messages: [{...alert.messages[2], status: 'FAILED'}, {...failure(['new-id']).messages[0], status: 'RETRY'}]};
     assert.equal((await request(changed)).status, 200);
-    assert.equal(sent.length, 2);
-    assert.doesNotMatch(sent[1].text, /Message ID: PROCESSING/);
-    assert.match(sent[1].text, /Status: RETRY\n/);
+    assert.equal(sent.length, 8);
+    assert.doesNotMatch(sent[7].text, /Message ID: PROCESSING/);
+    assert.match(sent[7].text, /Status: RETRY\n/);
     assert.equal((await request({...failure(['new-id'])})).status, 200);
-    assert.equal(sent.length, 2); // Legacy and updated senders share per-message receipts.
+    assert.equal(sent.length, 8); // Legacy and updated senders share per-message receipts.
   });
 });
 test('relay validates error excerpts and accepts a full batch of 2000-character Unicode errors', async () => {
@@ -219,11 +219,12 @@ test('relay validates error excerpts and accepts a full batch of 2000-character 
     alert.messages = alert.messages.map(message => ({...message, status: 'FAILED', errorText: '😀'.repeat(1000)}));
     assert.ok(Buffer.byteLength(JSON.stringify(alert)) > 100000);
     assert.equal((await request(alert)).status, 200);
-    assert.equal(sent.length, 1);
-    assert.equal((sent[0].text.match(/Error: /g) || []).length, 50);
-    assert.ok(sent[0].text.includes('😀'.repeat(1000)));
+    assert.equal(sent.length, 50);
+    assert.ok(sent.every(mail => (mail.text.match(/Error: /g) || []).length === 1));
+    assert.ok(sent.every(mail => mail.text.includes('😀'.repeat(1000))));
+    assert.equal(new Set(sent.map(mail => mail.subject)).size, 50);
     assert.equal((await request(alert)).status, 200);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 50);
   });
 });
 test('retries SMTP errors and suppresses duplicate/regrouped sends including persisted receipts', async () => {
@@ -285,4 +286,48 @@ test('relay supports regional and custom origins while rejecting malformed tenan
     const badLink = {...failure(), messages: failure().messages.map(message => ({...message, url: message.url.replace('https://', 'https://user:pass@')}))};
     assert.equal((await request(badLink)).status, 400);
   });
+});
+
+test('mixed legacy batches become isolated emails and persist partial success across a relay restart', async () => {
+  const mails = [];
+  let fail = true;
+  const transport = {async sendMail(mail) {
+    if (fail && mail.text.includes('Message ID: discarded\n')) throw new Error('Temporary SMTP failure');
+    mails.push(mail);
+    return {accepted: ['recipient@gmail.com'], rejected: []};
+  }};
+  await relayFixture(async ({request, config}) => {
+    const alert = {...failure(['redirect', 'discarded', 'unrelated', 'same-error', 'same-error']), kind: 'messages'};
+    alert.messages = alert.messages.map(message => ({...message,
+      status: message.id === 'discarded' ? 'DISCARDED' : 'FAILED',
+      errorText: message.id === 'redirect' ? 'HTTP operation failed with statusCode: 302' :
+        message.id === 'discarded' ? 'No error information available.' : 'Receiver connection refused'}));
+    assert.equal((await request(alert)).status, 502);
+    assert.equal(mails.length, 1);
+    assert.match(mails[0].text, /Message ID: redirect\n/);
+    fail = false;
+    const restarted = await createRelay(config);
+    await new Promise(resolve => restarted.listen(0, '127.0.0.1', resolve));
+    try {
+      const resend = () => fetch(`http://127.0.0.1:${restarted.address().port}/alert`, {
+        method: 'POST', headers: {Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/json'}, body: JSON.stringify(alert)
+      });
+      assert.equal((await resend()).status, 200);
+      assert.equal((await resend()).status, 200);
+      assert.equal(mails.length, 4);
+      assert.equal(new Set(mails.map(mail => mail.subject)).size, 4);
+      assert.ok(mails.every(mail => (mail.text.match(/Message ID: /g) || []).length === 1));
+      const filtered = mails.filter(mail => mail.text.includes('with statusCode: 302'));
+      const actionable = mails.filter(mail => !mail.text.includes('with statusCode: 302'));
+      assert.equal(filtered.length, 1);
+      assert.equal(actionable.length, 3);
+      assert.match(actionable[0].text, /Status: DISCARDED/);
+      assert.ok(actionable.some(mail => mail.text.includes('Message ID: unrelated\n')));
+      assert.ok(actionable.every(mail => !mail.text.includes('Message ID: redirect\n')));
+    } finally {await new Promise(resolve => restarted.close(resolve));}
+  }, transport);
+});
+
+test('email composition refuses mixed messages rather than creating an unsafe email', () => {
+  assert.throws(() => composeEmail(failure(['a', 'b'])), /one SAP message per email/);
 });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "IS Message Watchdog",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Monitor Integration Suite tenants, email non-Completed messages and detect monitoring interruptions.",
   "minimum_chrome_version": "120",
   "permissions": [

@@ -132,10 +132,14 @@ async function tick(run) {
       if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
       const batch = await withErrorDetails(run, fresh.slice(offset, offset + 50));
       if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
-      await relay('/alert', run.token, {kind: 'messages', run: run.startedAt, tenant: run.tenant, messages: batch});
-      run.seen.push(...batch.map(message => message.id));
-      run.sent += batch.length;
-      await save();
+      // Gmail filters the entire email, so unrelated SAP messages must never share one.
+      for (const message of batch) {
+        if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
+        await relay('/alert', run.token, {kind: 'messages', run: run.startedAt, tenant: run.tenant, messages: [message]});
+        run.seen.push(message.id);
+        run.sent++;
+        await save();
+      }
     }
     if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
     try {

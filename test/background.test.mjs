@@ -21,12 +21,12 @@ test('status selections persist per tenant, filter baselines and polls, and can 
   h.sap.set(TENANT, [scoped('old-failed', 'FAILED'), scoped('failed', 'FAILED'), scoped('retry', 'RETRY'), scoped('processing', 'PROCESSING'), scoped('wrong-flow', 'FAILED', 'other-flow'), scoped('completed', 'COMPLETED')]);
   h.sap.set(TRIAL_TENANT, [{...message('escalated'), Status: 'ESCALATED'}, message('ignored')]);
   await h.reload(); await h.poll();
-  assert.deepEqual(h.delivered.find(alert => alert.tenant === TENANT).messages.map(item => item.id), ['failed', 'retry']);
+  assert.deepEqual(h.delivered.filter(alert => alert.tenant === TENANT).flatMap(alert => alert.messages.map(item => item.id)), ['failed', 'retry']);
   assert.deepEqual(h.delivered.find(alert => alert.tenant === TRIAL_TENANT).messages.map(item => item.id), ['escalated']);
   const changed = await h.request('updateStatuses', TENANT, {emailStatuses: ['PROCESSING']});
   assert.equal(changed.ok, true);
   await h.reload(); await h.poll();
-  assert.deepEqual(h.delivered[2].messages.map(item => item.id), ['processing']);
+  assert.deepEqual(h.delivered.at(-1).messages.map(item => item.id), ['processing']);
   const updated = h.store.state.runs[TENANT];
   for (const key of ['startedAt', 'endsAt', 'tabId']) assert.equal(updated[key], original[key]);
   assert.deepEqual(updated.scope, original.scope);
@@ -35,7 +35,7 @@ test('status selections persist per tenant, filter baselines and polls, and can 
   assert.ok(h.reads.some(read => new URL(read.url).searchParams.get('$filter').includes("(Status eq 'PROCESSING')")));
   h.sap.set(TENANT, [scoped('retry', 'PROCESSING')]); // Already emailed under Retry.
   await h.poll();
-  assert.equal(h.delivered.length, 3);
+  assert.equal(h.delivered.length, 4);
 }));
 test('empty or invalid status selections do not start a run or change a saved selection', () => fixture(async h => {
   for (const emailStatuses of [[], null, ['COMPLETED'], ['ALL'], ['FAILED', 'bad'], "FAILED"]) {
@@ -240,3 +240,32 @@ test('runtime selector is preserved for custom tenants and test email uses the r
   await h.request('test');
   assert.equal(h.delivered[0].kind, 'test');
 }));
+
+test('individual alerts persist progress and retry only unsent messages after a delivery failure and worker restart', async () => {
+  const accepted = [];
+  let fail = true;
+  await fixture(async h => {
+    await h.start();
+    h.sap.set(TENANT, [message('redirect'), message('unrelated'), message('later')]);
+    h.sapErrors.set(`${TENANT}:redirect`, 'HTTP operation failed with statusCode: 302');
+    h.sapErrors.set(`${TENANT}:unrelated`, 'Receiver connection refused');
+    await h.poll();
+    assert.deepEqual(accepted.map(alert => alert.messages[0].id), ['redirect']);
+    assert.deepEqual(h.store.state.runs[TENANT].seen, ['redirect']);
+    assert.equal(h.store.state.runs[TENANT].sent, 1);
+    fail = false;
+    await h.reload(); await h.poll(); await h.poll();
+    assert.deepEqual(accepted.map(alert => alert.messages[0].id), ['redirect', 'unrelated', 'later']);
+    assert.ok(accepted.every(alert => alert.messages.length === 1));
+    assert.equal(h.store.state.runs[TENANT].sent, 3);
+    assert.equal(h.store.state.runs[TENANT].status, 'Watching');
+    assert.doesNotMatch(accepted[1].messages[0].errorText, /statusCode: 302/);
+  }, {relayFetch: async (url, options) => {
+    const alert = options.body && JSON.parse(options.body);
+    if (alert?.kind === 'messages') {
+      if (fail && alert.messages.some(message => message.id === 'unrelated')) return Response.json({error: 'Temporary SMTP failure'}, {status: 502});
+      accepted.push(alert);
+    }
+    return Response.json({ok: true});
+  }});
+});

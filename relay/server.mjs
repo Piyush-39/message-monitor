@@ -47,8 +47,10 @@ export function composeEmail(alert) {
     subject: `IS Watchdog: monitoring needs attention — ${new URL(alert.tenant).hostname}`,
     text: `Monitoring cannot currently confirm new non-Completed messages.\n\n${alert.problem}\n\nOpen the watchdog tab and sign in again if needed. Checks will retry every minute until the nine-hour run ends.\n\n${alert.tenant}/shell/monitoring`
   };
+  if (alert.messages.length !== 1) throw new Error('Compose one SAP message per email.');
   return {
-    subject: `IS Watchdog: ${alert.messages.length} new non-Completed message${alert.messages.length === 1 ? '' : 's'} — ${new URL(alert.tenant).hostname}`,
+    // A distinct subject keeps separate SAP messages out of the same Gmail conversation.
+    subject: `IS Watchdog: 1 new non-Completed message — ${new URL(alert.tenant).hostname} — ${alert.messages[0].id}`,
     text: alert.messages.map(message => `Status: ${message.status ?? 'FAILED'}\nFlow: ${message.flow}\nMessage ID: ${message.id}\nTime: ${message.time || 'Unavailable'}\nError: ${message.errorText || 'Error details unavailable. Open the message in IS for details.'}\nOpen: ${message.url}`).join('\n\n')
   };
 }
@@ -80,6 +82,12 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     const key = alertKey(alert);
     if (receipts[key]) return {ok: true, duplicate: true};
     const isMessageBatch = ['messages', 'failures'].includes(alert.kind);
+    if (isMessageBatch && alert.messages.length > 1) {
+      // Split older extensions' batches too. Each accepted message persists its own
+      // receipt before attempting the next, so a partial failure can safely retry.
+      for (const message of alert.messages) await deliver({...alert, messages: [message]});
+      return {ok: true};
+    }
     const filtered = isMessageBatch ? {...alert, messages: alert.messages.filter(message =>
       !receipts[`message:${alert.tenant}:${message.id}`] && !(alert.tenant === LEGACY_TENANT && receipts[`message:${message.id}`])
     )} : alert;

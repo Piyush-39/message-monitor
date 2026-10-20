@@ -1,13 +1,14 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>IS Message Watchdog</title><link rel="stylesheet" href="popup.css"></head>
 <body><h1>IS Message Watchdog</h1>
-<p>Choose which message statuses to email for your selected artifacts. Each tenant is checked every minute for nine hours.</p>
-<label for="token">Local email relay key</label>
+<p>Choose which message statuses to notify you about for your selected artifacts. Each tenant is checked every minute for nine hours.</p>
+<label for="token">Local notification relay key</label>
 <input id="token" type="password" placeholder="From npm run setup" autocomplete="off">
-<fieldset id="email-statuses" aria-describedby="status-hint"><legend>Email these statuses</legend><div id="status-options"></div></fieldset>
+<fieldset id="email-statuses" aria-describedby="status-hint"><legend>Notify for these statuses</legend><div id="status-options"></div></fieldset>
 <p id="status-hint" class="hint">Choose at least one. Completed is always excluded. Changes apply to this tenant when you click Start or Save statuses.</p>
-<div class="actions"><button id="start">Start this tenant</button><button id="test" class="secondary">Send test email</button></div>
+<div class="actions"><button id="start">Start this tenant</button><button id="test" class="secondary">Send test notification</button></div>
 <p id="status" role="status" aria-live="polite">Loading…</p>
+<p id="delivery-status" class="hint" role="status" aria-live="polite"></p>
 <div id="runs" aria-label="Tenant monitoring runs"></div>
-<p class="hint">Open each tenant's Monitor Message Processing page and click Start. Keep Chrome and the relay running. Missing heartbeats trigger an email after three minutes.</p>
+<p class="hint">Open each tenant's Monitor Message Processing page and click Start. Keep Chrome and the relay running. Missing heartbeats trigger an alert after three minutes.</p>
 <script type="module" src="popup.js"></script></body></html>

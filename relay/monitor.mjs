@@ -60,7 +60,7 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
       for (const lease of Object.values(leases)) {
         if (now() >= lease.endsAt) continue;
         lease.notice ||= {episode: now(), sent: false,
-          problem: 'The local email relay is stopping while this tenant is being monitored. Restart the relay to restore email alerts.'};
+          problem: 'The local notification relay is stopping while this tenant is being monitored. Restart the relay to restore alerts.'};
         await save();
         try {await sendNotice(lease);}
         catch { /* Persist for delivery after the relay is restarted. */ }

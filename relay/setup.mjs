@@ -16,7 +16,7 @@ try {
   console.log(token);
 } catch (error) {
   console.error(error.code === 'ENOENT'
-    ? 'Create .env with your email settings first (see .env.example), then run npm run setup.'
+    ? 'Create .env with your notification settings first (see .env.example), then run npm run setup.'
     : `Setup failed: ${error.code || error.message}`);
   process.exitCode = 1;
 }

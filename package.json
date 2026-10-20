@@ -1,6 +1,6 @@
 {
   "name": "is-message-watchdog",
-  "version": "1.5.3",
+  "version": "1.6.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,7 +9,8 @@
   "scripts": {
     "setup": "node relay/setup.mjs",
     "start": "node --env-file=.env relay/server.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "setup:discord": "node relay/setup-discord.mjs"
   },
   "dependencies": {
     "nodemailer": "10.1.0"

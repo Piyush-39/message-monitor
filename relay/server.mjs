@@ -4,6 +4,7 @@ import { readFile, writeFile, rename } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import nodemailer from 'nodemailer';
 import {messageEmail} from './email.mjs';
+import {discordConfig, createDiscordDelivery} from './discord.mjs';
 import { LEGACY_TENANT, isTenantOrigin } from '../extension/core.js';
 import {createMonitoringWatch, validateMonitor} from './monitor.mjs';
 
@@ -62,8 +63,8 @@ async function jsonBody(request, limit = 1000000) {
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
-export async function createRelay({token, user, recipient, transport, stateFile = '.relay-state.json', monitorFile = `${stateFile}.monitoring`, now = Date.now}) {
-  if (!token || token.length < 32 || !EMAIL.test(user || '') || !EMAIL.test(recipient || '')) throw new Error('Run npm run setup first.');
+export async function createRelay({token, user, recipient, transport, stateFile = '.relay-state.json', monitorFile = `${stateFile}.monitoring`, now = Date.now, discordDelivery}) {
+  if (!token || token.length < 32 || (!discordDelivery && (!EMAIL.test(user || '') || !EMAIL.test(recipient || '')))) throw new Error('Run npm run setup first.');
   let receipts = {};
   try { receipts = JSON.parse(await readFile(stateFile, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -89,14 +90,20 @@ export async function createRelay({token, user, recipient, transport, stateFile 
       !receipts[`message:${alert.tenant}:${message.id}`] && !(alert.tenant === LEGACY_TENANT && receipts[`message:${message.id}`])
     )} : alert;
     if (isMessageBatch && !filtered.messages.length) return {ok: true, duplicate: true};
-    const mail = composeEmail(filtered);
-    const info = await transport.sendMail({from: user, to: recipient, ...mail});
-    if (!info.accepted?.length || info.rejected?.length) throw new Error('Gmail did not accept the recipient');
+    if (discordDelivery) {
+      // The outbox must be durable before acknowledging this message to Chrome.
+      // Queue deduplication also protects a retry if the receipt write below fails.
+      await discordDelivery.enqueue(filtered);
+    } else {
+      const mail = composeEmail(filtered);
+      const info = await transport.sendMail({from: user, to: recipient, ...mail});
+      if (!info.accepted?.length || info.rejected?.length) throw new Error('Gmail did not accept the recipient');
+    }
     receipts[key] = Date.now();
     if (isMessageBatch) for (const message of filtered.messages) receipts[`message:${alert.tenant}:${message.id}`] = Date.now();
     await writeFile(`${stateFile}.tmp`, JSON.stringify(receipts), {mode: 0o600});
     await rename(`${stateFile}.tmp`, stateFile);
-    return {ok: true};
+    return {ok: true, ...(discordDelivery ? {queued: true, provider: 'discord'} : {})};
   }
   const monitor = await createMonitoringWatch({stateFile: monitorFile, sendAlert: deliver, now});
   const server = http.createServer(async (request, response) => {
@@ -115,7 +122,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     const supplied = Buffer.from(request.headers.authorization || '');
     const expected = Buffer.from(`Bearer ${token}`);
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return reply(401, {error: 'Invalid relay key'});
-    if (request.method === 'GET' && request.url === '/health') return reply(200, {ok: true});
+    if (request.method === 'GET' && request.url === '/health') return reply(200, {ok: true, ...(discordDelivery ? {delivery: discordDelivery.status()} : {})});
     if (request.method !== 'POST' || !['/alert', '/monitor'].includes(request.url)) return reply(404, {error: 'Not found'});
     let alert;
     try {
@@ -127,8 +134,8 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     try { return reply(200, await result); }
     catch (error) {
       // Do not log SMTP credentials, message bodies, or provider responses.
-      console.error('Email delivery failed:', error.code || 'DELIVERY_ERROR');
-      return reply(502, {error: 'Email delivery failed. Check the Gmail app password and relay terminal.'});
+      console.error('Notification delivery failed:', error.code || 'DELIVERY_ERROR');
+      return reply(502, {error: discordDelivery ? 'Could not save the Discord alert. Check relay disk access and the relay terminal.' : 'Email delivery failed. Check the Gmail app password and relay terminal.'});
     }
   });
   server.requestTimeout = 15000;
@@ -137,24 +144,32 @@ export async function createRelay({token, user, recipient, transport, stateFile 
   server.notifyShutdown = () => serialize(() => monitor.shutdown());
   let timer;
   server.once('listening', () => {
+    discordDelivery?.start();
     server.checkMonitoring().catch(error => console.error('Monitoring check failed:', error.code || 'MONITOR_ERROR'));
     timer = setInterval(() => server.checkMonitoring().catch(error => console.error('Monitoring check failed:', error.code || 'MONITOR_ERROR')), 30000);
     timer.unref();
   });
-  server.once('close', () => clearInterval(timer));
+  server.once('close', () => {clearInterval(timer); discordDelivery?.stop();});
   return server;
 }
 async function main() {
   const {SMTP_USER: user, SMTP_PASS: pass, ALERT_TO: recipient = user, RELAY_TOKEN: token} = process.env;
-  if (!pass || !/^[a-zA-Z0-9]{16}$/.test(pass.replace(/\s/g, ''))) throw new Error('Set SMTP_PASS in .env to your 16-character Gmail app password.');
-  const transport = nodemailer.createTransport({
-    host: 'smtp.gmail.com', port: 465, secure: true,
-    auth: {user, pass: pass.replace(/\s/g, '')},
-    connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000
-  });
-  // Fail before starting if Gmail login is invalid. This does not send an email.
-  await transport.verify();
-  const server = await createRelay({token, user, recipient, transport});
+  const provider = process.env.NOTIFICATION_PROVIDER || 'email';
+  if (!['email', 'discord'].includes(provider)) throw new Error('NOTIFICATION_PROVIDER must be email or discord.');
+  let transport, discordDelivery;
+  if (provider === 'discord') {
+    discordDelivery = await createDiscordDelivery({...discordConfig(process.env), stateFile: '.relay-state.json.discord'});
+  } else {
+    if (!pass || !/^[a-zA-Z0-9]{16}$/.test(pass.replace(/\s/g, ''))) throw new Error('Set SMTP_PASS in .env to your 16-character Gmail app password.');
+    transport = nodemailer.createTransport({
+      host: 'smtp.gmail.com', port: 465, secure: true,
+      auth: {user, pass: pass.replace(/\s/g, '')},
+      connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000
+    });
+    // Email mode checks login without sending. Discord mode does not contact Gmail.
+    await transport.verify();
+  }
+  const server = await createRelay({token, user, recipient, transport, discordDelivery});
   let shuttingDown = false;
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
     if (shuttingDown) return;
@@ -162,14 +177,17 @@ async function main() {
     // SIGKILL/power loss cannot run this handler. Persisted leases detect the gap after restart.
     const deadline = setTimeout(() => process.exit(1), 20000);
     deadline.unref();
+    try {
+      await server.notifyShutdown();
+      if (discordDelivery) await discordDelivery.flush();
+    } catch (error) {console.error('Shutdown notice could not be sent:', error.code || 'MONITOR_ERROR');}
+    discordDelivery?.stop();
     server.close();
     server.closeIdleConnections();
-    try {await server.notifyShutdown();}
-    catch (error) {console.error('Shutdown notice could not be sent:', error.code || 'MONITOR_ERROR');}
-    transport.close();
+    transport?.close();
     process.exit(0);
   });
-  server.listen(43171, '127.0.0.1', () => console.log(`Email relay ready at http://127.0.0.1:43171. Alerts go to ${recipient}.`));
+  server.listen(43171, '127.0.0.1', () => console.log(provider === 'discord' ? 'Discord relay ready at http://127.0.0.1:43171. All alerts use the configured Discord channel.' : `Email relay ready at http://127.0.0.1:43171. Alerts go to ${recipient}.`));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(error => {

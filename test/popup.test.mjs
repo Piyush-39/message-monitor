@@ -11,7 +11,7 @@ test('popup adds a second tenant with scoped permission and targets independent 
       addEventListener(event, handler) {this.click = handler;}
     };
   }
-  const elements = Object.fromEntries(['status', 'token', 'start', 'test', 'runs', 'email-statuses', 'status-options'].map(id => [id, element('div', id)]));
+  const elements = Object.fromEntries(['status', 'token', 'start', 'test', 'runs', 'email-statuses', 'status-options', 'delivery-status'].map(id => [id, element('div', id)]));
   function flatten(node) {return [node, ...node.children.flatMap(flatten)];}
   globalThis.document = {
     querySelector(selector) {return elements[selector.slice(1)];}, createElement: tag => element(tag),
@@ -59,21 +59,25 @@ test('popup adds a second tenant with scoped permission and targets independent 
   const firstCard = elements.runs.children[0];
   assert.equal(firstCard.children[0].textContent, new URL(TRIAL_TENANT).hostname);
   assert.match(firstCard.children[1].textContent, /Monitoring: 2 iFlows\nPackage: package-a/);
-  assert.match(firstCard.children[1].textContent, /Messages emailed: 3\nEmail statuses: Escalated/);
-  assert.match(elements.runs.children[1].children[1].textContent, /Email statuses: Failed, Retry/);
+  assert.match(firstCard.children[1].textContent, /Messages accepted by relay: 3\nAlert statuses: Escalated/);
+  assert.match(elements.runs.children[1].children[1].textContent, /Alert statuses: Failed, Retry/);
   assert.doesNotMatch(firstCard.children[1].textContent, /flow-a|flow-b/);
   assert.match(elements.runs.children[1].children[1].textContent, /Monitoring: All iFlows/);
   choose(['PROCESSING']); calls.length = 0;
   await elements.start.click();
   assert.deepEqual(calls[0].message, {type: 'updateStatuses', token: 'local-test-key', tenant: TENANT, emailStatuses: ['PROCESSING']});
   assert.equal(calls.some(call => call.permission), false);
-  assert.match(elements.runs.children[1].children[1].textContent, /Email statuses: Processing/);
+  assert.match(elements.runs.children[1].children[1].textContent, /Alert statuses: Processing/);
   assert.deepEqual(initial.emailStatuses, ['ESCALATED']);
   elements['status-options'].children = [];
   await import('../extension/popup.js?reopen');
   assert.deepEqual(inputs().filter(input => input.checked).map(input => input.value), ['PROCESSING']);
   initial.scope = {artifactIds: ['only-flow', 'only-flow'], packageId: null};
+  state.delivery = {provider: 'discord', pending: 3, delivered: 8,
+    errors: {discord: 'Discord rate limit; waiting to retry.'}};
   await elements.test.click();
+  assert.match(elements['delivery-status'].textContent, /Discord: 3 queued\./);
+  assert.match(elements['delivery-status'].textContent, /discord: Discord rate limit/);
   assert.match(elements.runs.children[0].children[1].textContent, /Monitoring: 1 iFlow$/);
   assert.doesNotMatch(elements.runs.children[0].children[1].textContent, /only-flow/);
   initial.scope = {artifactIds: [], packageId: 'package-a'};

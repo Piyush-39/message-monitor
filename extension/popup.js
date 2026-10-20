@@ -5,6 +5,7 @@ const token = document.querySelector('#token');
 const start = document.querySelector('#start');
 const test = document.querySelector('#test');
 const list = document.querySelector('#runs');
+const deliveryStatus = document.querySelector('#delivery-status');
 const statusFieldset = document.querySelector('#email-statuses');
 const statusOptions = document.querySelector('#status-options');
 const statusInputs = EMAIL_STATUSES.map(value => {
@@ -35,6 +36,10 @@ async function send(type, targetTenant) {
 }
 async function render(notice = '') {
   const state = await send('status');
+  const delivery = state.delivery;
+  deliveryStatus.textContent = delivery?.provider === 'discord'
+    ? `Discord: ${delivery.pending} queued. ${delivery.delivered} delivered in the last 30 days.${delivery.failed ? ` ${delivery.failed} alerts need repair.` : ''}${delivery.fatalError ? `\n${delivery.fatalError}` : ''}${Object.entries(delivery.errors || {}).map(([channel, error]) => `\n${channel}: ${error}`).join('')}`
+    : delivery?.error || '';
   const currentRun = state.runs.find(run => run.tenant === tenant);
   currentRunning = Boolean(currentRun?.running);
   if (!initializedStatuses) {
@@ -54,13 +59,13 @@ async function render(notice = '') {
     const heading = document.createElement('h2');
     heading.textContent = new URL(run.tenant).hostname;
     const detail = document.createElement('p');
-    detail.textContent = `${run.status}\nEnds: ${new Date(run.endsAt).toLocaleTimeString()}\nMessages emailed: ${run.sent}\nEmail statuses: ${emailStatuses(run.emailStatuses).map(statusLabel).join(', ')}`;
+    detail.textContent = `${run.status}\nEnds: ${new Date(run.endsAt).toLocaleTimeString()}\nMessages accepted by relay: ${run.sent}\nAlert statuses: ${emailStatuses(run.emailStatuses).map(statusLabel).join(', ')}`;
     const count = new Set(run.scope?.artifactIds || []).size;
     detail.textContent += `\nMonitoring: ${count ? `${count} iFlow${count === 1 ? '' : 's'}` : run.scope?.packageId ? 'All iFlows in the selected package' : 'All iFlows'}`;
     if (run.scope?.packageId) detail.textContent += `\nPackage: ${run.scope.packageId}`;
     if (run.lastCheck) detail.textContent += `\nLast check: ${new Date(run.lastCheck).toLocaleTimeString()}`;
     if (run.lastRefresh) detail.textContent += `\nLast table refresh: ${new Date(run.lastRefresh).toLocaleTimeString()}`;
-    if (run.tableRefresh === false) detail.textContent += '\nTable refresh unavailable; email checks continue.';
+    if (run.tableRefresh === false) detail.textContent += '\nTable refresh unavailable; alert checks continue.';
     if (run.problem) detail.textContent += `\n${run.problem}`;
     card.append(heading, detail);
     if (run.running) {

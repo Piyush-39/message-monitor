@@ -29,7 +29,7 @@ export const EMAIL_STATUSES = ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CA
 export const statusLabel = status => status[0] + status.slice(1).toLowerCase();
 export function emailStatuses(value = EMAIL_STATUSES) {
   if (!Array.isArray(value) || !value.length || value.some(status => !EMAIL_STATUSES.includes(status))) {
-    throw new Error('Select at least one email status. Completed is always excluded.');
+    throw new Error('Select at least one alert status. Completed is always excluded.');
   }
   return EMAIL_STATUSES.filter(status => value.includes(status));
 }

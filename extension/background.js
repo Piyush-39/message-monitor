@@ -24,12 +24,12 @@ async function relay(path, token, body) {
     response = await fetch(`${RELAY}${path}`, {
       method: body ? 'POST' : 'GET',
       headers: {Authorization: `Bearer ${token}`, ...(body ? {'Content-Type': 'application/json'} : {})},
-      ...(body ? {body: JSON.stringify(body)} : {}), signal: AbortSignal.timeout(20000)
+      ...(body ? {body: JSON.stringify(body)} : {}), signal: AbortSignal.timeout(path === '/health' ? 3000 : 20000)
     });
-  } catch { throw new Error('Email relay unavailable. Keep npm start running.'); }
+  } catch { throw new Error('Notification relay unavailable. Keep npm start running.'); }
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));
-    throw new Error(detail.error || `Email relay returned HTTP ${response.status}. Restart the updated relay if needed.`);
+    throw new Error(detail.error || `Notification relay returned HTTP ${response.status}. Restart the updated relay if needed.`);
   }
   return response.json();
 }
@@ -197,14 +197,24 @@ chrome.alarms.onAlarm.addListener(alarm => {
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || sender.tab) return;
   serialize(async () => {
-    if (message.type === 'status') return publicState();
+    if (message.type === 'status') {
+      const summary = publicState();
+      const token = message.token || (await chrome.storage.local.get('relayToken')).relayToken || Object.values(state.runs)[0]?.token;
+      if (token) {
+        try {
+          const health = await relay('/health', token);
+          if (health.delivery?.provider === 'discord') summary.delivery = health.delivery;
+        } catch {summary.delivery = {error: 'Notification relay unavailable. Keep npm start running.'};}
+      }
+      return summary;
+    }
     if (message.type === 'start') return start(message.token, message.sourceTabId, message.emailStatuses);
     if (message.type === 'updateStatuses') {
       const run = state.runs[message.tenant];
       if (!activeRun(run)) throw new Error('Start monitoring this tenant first.');
       run.emailStatuses = emailStatuses(message.emailStatuses);
       await save();
-      return {status: 'Email statuses saved. They apply from the next check.'};
+      return {status: 'Notification statuses saved. They apply from the next check.'};
     }
     if (message.type === 'stop') return stop(message.tenant);
     if (message.type === 'open') {
@@ -215,9 +225,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     }
     if (message.type === 'test') {
       const token = message.token || (await chrome.storage.local.get('relayToken')).relayToken;
-      await relay('/alert', token, {kind: 'test', nonce: crypto.randomUUID()});
+      const delivery = await relay('/alert', token, {kind: 'test', nonce: crypto.randomUUID()});
       await chrome.storage.local.set({relayToken: token});
-      return {status: 'Test email accepted by Gmail'};
+      return {status: delivery.provider === 'discord' ? 'Test notification queued for Discord. Check your alerts channel and relay delivery status.' : 'Test notification accepted by Gmail'};
     }
     throw new Error('Unknown action');
   }).then(value => respond({ok: true, value}), error => respond({ok: false, error: error.message}));

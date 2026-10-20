@@ -78,6 +78,16 @@ To change an active tenant, open its monitor or watchdog tab and reopen the popu
 
 Enabling another status can email previously unseen messages in that status within the run’s scan window. A message ID already recorded in the baseline or successfully emailed is still suppressed, even if it changes status.
 
+## Upgrade to version 1.5.3: heading contrast
+
+The iFlow and error headings now specify both dark text and a white background, and the email card has an explicit text color. This avoids light text inherited from a dark theme disappearing on the white email card. Restart the relay (Ctrl+C, then `npm start`) to apply this to future emails; no extension reload is needed for this rendering fix. Previously delivered emails are unchanged.
+
+## Upgrade to version 1.5.2: readable email alerts
+
+New alert subjects start with `[STATUS] iFlow name`, followed by `IS Watchdog`, the tenant and the unique SAP message ID. The HTML body shows a prominent text status badge and full iFlow heading, then tenant, time, message ID, an **Open message in SAP IS** link and error details. A plain-text alternative preserves the same information, and dynamic content is escaped in HTML. Each email still contains exactly one SAP message; Gmail filters using `IS Watchdog` and error phrases continue to match.
+
+Restart the relay in your Terminal (Ctrl+C, then `npm start`) to activate the format for future alerts. This formatting change needs no extension reload if version 1.5.1's single-message delivery is already installed. If you also reload the extension, its version shows 1.5.2. Existing emails keep their previous format and are not resent.
+
 ## Upgrade to version 1.5.1: independent email alerts
 
 Version 1.5.0 combined up to 50 SAP messages in one email. A Gmail filter matching one error archived or marked the entire email as read, including unrelated errors. Version 1.5.1 sends one email per SAP message and includes that message's ID in the subject. This increases the number of emails compared with batching. The updated relay also splits requests from older extensions, and persists each successful message receipt before attempting the next so partial failures and restarts do not resend confirmed deliveries.

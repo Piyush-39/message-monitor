@@ -145,7 +145,9 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     const tenantMails = mails.filter(mail => mail.subject.includes(new URL(TENANT).hostname));
     assert.equal(tenantMails.length, 7);
     const tenantMail = tenantMails.find(mail => mail.text.includes('Message ID: same-id\n'));
-    assert.match(tenantMail.subject, /1 new non-Completed message/);
+    assert.match(tenantMail.subject, /^\[FAILED\] flow — IS Watchdog — /);
+    assert.ok(tenantMail.html.includes('>FAILED</span>'));
+    assert.ok(tenantMail.html.includes('>flow</h1>'));
     assert.match(tenantMail.text, /Error: Receiver HTTP 500: Order service unavailable\nCaused by: connection refused/);
     assert.ok(tenantMails.some(mail => /Error: Error details unavailable\./.test(mail.text)));
     assert.ok(tenantMails.some(mail => /Error: No error information available\./.test(mail.text)));

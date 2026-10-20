@@ -196,7 +196,7 @@ test('relay emails actual statuses, rejects Completed and malformed statuses, an
     assert.equal(sent.length, 0);
     assert.equal((await request(alert)).status, 200);
     assert.equal(sent.length, 7);
-    assert.ok(sent.every(mail => /1 new non-Completed message/.test(mail.subject)));
+    assert.ok(sent.every(mail => /^\[[A-Z]+\] Test flow — IS Watchdog — /.test(mail.subject) && mail.html.includes('<h1')));
     for (const status of statuses) assert.ok(sent.some(mail => mail.text.includes(`Status: ${status}\n`)));
     const changed = {...alert, messages: [{...alert.messages[2], status: 'FAILED'}, {...failure(['new-id']).messages[0], status: 'RETRY'}]};
     assert.equal((await request(changed)).status, 200);
@@ -330,4 +330,29 @@ test('mixed legacy batches become isolated emails and persist partial success ac
 
 test('email composition refuses mixed messages rather than creating an unsafe email', () => {
   assert.throws(() => composeEmail(failure(['a', 'b'])), /one SAP message per email/);
+});
+
+
+test('alert format leads with status and iFlow, escapes HTML and preserves filter text and message identity', () => {
+  const alert = {...failure(['message-123']), kind: 'messages'};
+  alert.messages[0] = {...alert.messages[0], status: 'FAILED', flow: 'Orders <sync> & "receive"\r\nBcc: injected',
+    errorText: 'HTTP operation failed with statusCode: 302\n<script>alert("test")</script> & details',
+    url: `${TENANT}/shell/monitoring/Messages/message-123?first=1&second=2`};
+  const mail = composeEmail(alert);
+  assert.ok(mail.subject.startsWith('[FAILED] Orders <sync> & "receive" Bcc: injected — IS Watchdog — '));
+  assert.ok(mail.subject.endsWith(' — message-123'));
+  assert.doesNotMatch(mail.subject, /[\r\n]/);
+  assert.ok(mail.text.startsWith('Status: FAILED\niFlow: Orders'));
+  assert.ok(mail.text.includes(alert.messages[0].errorText));
+  assert.match(mail.html, /<h1[^>]*>Orders &lt;sync&gt; &amp; &quot;receive&quot;/);
+  assert.match(mail.html, /font-weight:bold;">FAILED<\/span>/);
+  assert.ok(mail.html.includes('with statusCode: 302'));
+  assert.ok(mail.html.includes('&lt;script&gt;alert(&quot;test&quot;)&lt;/script&gt; &amp; details'));
+  assert.ok(mail.html.includes('?first=1&amp;second=2"'));
+  assert.doesNotMatch(mail.html, /<script>|<sync>/);
+  const next = composeEmail({...alert, messages: [{...alert.messages[0], id: 'message-456'}]});
+  assert.notEqual(next.subject, mail.subject);
+  const legacy = composeEmail(failure());
+  assert.ok(legacy.subject.startsWith('[FAILED] Test flow'));
+  assert.ok(legacy.html.includes('Error details unavailable.'));
 });

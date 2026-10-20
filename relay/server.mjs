@@ -3,6 +3,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import nodemailer from 'nodemailer';
+import {messageEmail} from './email.mjs';
 import { LEGACY_TENANT, isTenantOrigin } from '../extension/core.js';
 import {createMonitoringWatch, validateMonitor} from './monitor.mjs';
 
@@ -48,11 +49,7 @@ export function composeEmail(alert) {
     text: `Monitoring cannot currently confirm new non-Completed messages.\n\n${alert.problem}\n\nOpen the watchdog tab and sign in again if needed. Checks will retry every minute until the nine-hour run ends.\n\n${alert.tenant}/shell/monitoring`
   };
   if (alert.messages.length !== 1) throw new Error('Compose one SAP message per email.');
-  return {
-    // A distinct subject keeps separate SAP messages out of the same Gmail conversation.
-    subject: `IS Watchdog: 1 new non-Completed message — ${new URL(alert.tenant).hostname} — ${alert.messages[0].id}`,
-    text: alert.messages.map(message => `Status: ${message.status ?? 'FAILED'}\nFlow: ${message.flow}\nMessage ID: ${message.id}\nTime: ${message.time || 'Unavailable'}\nError: ${message.errorText || 'Error details unavailable. Open the message in IS for details.'}\nOpen: ${message.url}`).join('\n\n')
-  };
+  return messageEmail(alert.tenant, alert.messages[0]);
 }
 // Allow 50 bounded error excerpts, including multibyte or JSON-escaped text.
 async function jsonBody(request, limit = 1000000) {

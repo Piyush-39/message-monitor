@@ -34,6 +34,11 @@ export function emailStatuses(value = EMAIL_STATUSES) {
 }
 export const POLL_ALARM = 'is-watchdog-poll';
 export const HEARTBEAT_ALARM = 'is-watchdog-heartbeat';
+export const CHECK_STALE_MS = 3 * 60 * 1000;
+export function checkOverdue(run, now = Date.now()) {
+  const lastCheck = run.lastCheck || run.startedAt;
+  return Boolean(run.running && lastCheck && now - lastCheck >= CHECK_STALE_MS);
+}
 // Retained only to clear alarms created by earlier versions.
 export const END_ALARM = 'is-watchdog-end';
 export const endAlarm = tenant => `${END_ALARM}:${tenant}`;

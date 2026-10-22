@@ -1,4 +1,4 @@
-import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, emailStatuses, POLL_ALARM, HEARTBEAT_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
+import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, emailStatuses, POLL_ALARM, HEARTBEAT_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun, checkOverdue } from './core.js';
 import { readNonCompletedMessages, readMessageErrors, refreshMessageTable } from './poll.js';
 
 const RELAY = 'http://127.0.0.1:43171';
@@ -107,6 +107,21 @@ async function stop(tenant, reason = 'Stopped by you') {
   await updateControls();
   return {status: reason};
 }
+async function resetData() {
+  for (const run of Object.values(state.runs).filter(activeRun)) {
+    await stop(run.tenant, 'Stopped for data reset');
+  }
+  // Keep cancellation credentials until the relay confirms that its leases ended.
+  // Otherwise clearing storage offline would produce false interruption alerts.
+  if (state.pendingStops.length) await flushStops();
+  if (state.pendingStops.length) throw new Error('Monitoring stopped, but the relay could not confirm cancellation. Start the relay and try Reset data again.');
+  await writes;
+  await chrome.storage.local.clear();
+  state = monitoringState();
+  await chrome.alarms.clearAll();
+  await updateControls();
+  return {status: 'Extension data reset. Connect your relay again to start monitoring.'};
+}
 async function start(token, sourceTabId, selectedStatuses) {
   const statuses = emailStatuses(selectedStatuses);
   const source = Number.isInteger(sourceTabId) ? await chrome.tabs.get(sourceTabId) : (await chrome.tabs.query({active: true, currentWindow: true}))[0];
@@ -123,7 +138,7 @@ async function start(token, sourceTabId, selectedStatuses) {
   const startedAt = Date.now();
   const run = {
     running: true, token, tenant, scope, emailStatuses: statuses, tabId: tab.id, startedAt, endsAt: null,
-    seen: baseline.map(message => message.id), sent: 0, lastCheck: startedAt,
+    seen: baseline.map(message => message.id), sent: 0, lastCheckAlerts: 0, lastCheck: startedAt,
     status: 'Watching', phase: 'Waiting for next check', problem: null, problemEpisode: null, restoreAutoDiscardable
   };
   state.runs[tenant] = run;
@@ -146,6 +161,8 @@ async function tick(run) {
     run.phase = 'Reading SAP messages';
     const messages = await read(run, run.startedAt - 5 * 60 * 1000);
     run.lastCheck = Date.now();
+    run.lastCheckAlerts = 0;
+    await save();
     // Keep UI/session activity ahead of potentially slow notification delivery.
     try {
       const refreshed = await chrome.scripting.executeScript({target: {tabId: run.tabId}, world: 'MAIN', func: refreshMessageTable, args: [run.tenant]});
@@ -168,6 +185,7 @@ async function tick(run) {
         await relay('/alert', run.token, {kind: 'messages', run: run.startedAt, tenant: run.tenant, messages: [message]});
         run.seen.push(message.id);
         run.sent++;
+        run.lastCheckAlerts++;
         run.pendingAlerts--;
         await save();
       }
@@ -220,7 +238,7 @@ chrome.alarms.onAlarm.addListener(alarm => {
       if (heartbeatTasks.has(run.tenant)) continue;
       const task = (async () => {
         // A responsive worker does not prove SAP polling is still making progress.
-        if (Date.now() - run.lastCheck >= 180000 && !run.problem) {
+        if (checkOverdue(run) && !run.problem) {
           await reportProblem(run, new Error(`No SAP check has succeeded for at least three minutes, although the extension is responding. Last activity: ${run.phase || 'not recorded'}. Open the watchdog Message Monitoring tab and check the relay. Session expiry is not confirmed.`));
         } else if (run.problemEpisode && !run.problemEpisode.sent) await reportProblem(run, new Error(run.problem));
         else await heartbeat(run);
@@ -229,14 +247,14 @@ chrome.alarms.onAlarm.addListener(alarm => {
     }
     return;
   }
-  serialize(async () => {
+  return serialize(async () => {
     if (alarm.name === POLL_ALARM) return tickAll();
     // Ignore end alarms already queued by an earlier extension version.
   }).catch(console.error);
 });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || sender.tab) return;
-  serialize(async () => {
+  const operation = async () => {
     if (message.type === 'status') {
       const summary = publicState();
       summary.relay = {connected: false, error: 'Add your notification relay key in Relay settings.'};
@@ -245,14 +263,16 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         try {
           const health = await relay('/health', token);
           summary.relay = {connected: true};
-          if (health.delivery?.provider === 'discord') summary.delivery = health.delivery;
+          summary.inactiveDeliveries = health.inactiveDeliveries || [];
+          if (['discord', 'teams'].includes(health.delivery?.provider)) summary.delivery = health.delivery;
         } catch (error) {
           summary.relay = {connected: false, error: error.message};
           summary.delivery = {error: error.message};
         }
       }
-      return summary;
+      return {...summary, ...publicState()};
     }
+    if (message.type === 'reset') return resetData();
     if (message.type === 'start') return start(message.token, message.sourceTabId, message.emailStatuses);
     if (message.type === 'connect') {
       await relay('/health', message.token);
@@ -277,14 +297,18 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       const token = message.token || (await chrome.storage.local.get('relayToken')).relayToken;
       const delivery = await relay('/alert', token, {kind: 'test', nonce: crypto.randomUUID()});
       await chrome.storage.local.set({relayToken: token});
-      return {status: delivery.provider === 'discord' ? 'Test notification queued for Discord. Check your alerts channel and relay delivery status.' : 'Test notification accepted by Gmail'};
+      return {status: delivery.provider === 'teams' ? 'Test notification queued for Teams. Check your channel and workflow run history to confirm the post.' : delivery.provider === 'discord' ? 'Test notification queued for Discord. Check your alerts channel and relay delivery status.' : 'Test notification accepted by Gmail'};
     }
     throw new Error('Unknown action');
-  }).then(value => respond({ok: true, value}), error => respond({ok: false, error: error.message}));
+  };
+  // A hung SAP read or notification handoff must not hide the last completed
+  // check from the popup. Mutations still run in order after initialization.
+  (message.type === 'status' ? initialized.then(operation) : serialize(operation))
+    .then(value => respond({ok: true, value}), error => respond({ok: false, error: error.message}));
   return true;
 });
 
-serialize(async () => {
+const initialized = serialize(async () => {
   await chrome.storage.local.setAccessLevel({accessLevel: 'TRUSTED_CONTEXTS'});
   state = monitoringState((await chrome.storage.local.get('state')).state);
   await save();

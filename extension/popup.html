@@ -60,7 +60,12 @@
     <div class="connection-row"><span id="relay-state" class="relay-state"><span class="dot" aria-hidden="true"></span><span id="relay-label">Checking notification relay…</span></span><button id="test" class="link" type="button">Send test</button></div>
     <p id="delivery-status" class="hint" role="status" aria-live="polite" hidden></p>
   </section>
-  <footer>Keep Chrome, the watchdog tab, and the local relay running.<br>Missing heartbeats trigger an alert after 3 minutes.</footer>
+  <section id="reset-confirmation" class="reset-confirmation" aria-labelledby="reset-heading" hidden>
+    <h2 id="reset-heading">Reset extension data?</h2>
+    <p>This stops all monitoring and clears saved tenants, filters, counters and the relay key. Notifications already queued in the local relay are kept.</p>
+    <div class="reset-actions"><button id="cancel-reset" class="secondary" type="button">Cancel</button><button id="confirm-reset" class="secondary reset-danger" type="button">Reset all data</button></div>
+  </section>
+  <footer><div class="footer-row"><span>Keep Chrome, the watchdog tab, and the local relay running.<br>Missing heartbeats trigger an alert after 3 minutes.</span><button id="reset-data" class="link" type="button">Reset data</button></div></footer>
   <script type="module" src="popup.js"></script>
 </body>
 </html>

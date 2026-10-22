@@ -265,6 +265,7 @@ test('individual alerts persist progress and retry only unsent messages after a 
     assert.deepEqual(accepted.map(alert => alert.messages[0].id), ['redirect']);
     assert.deepEqual(h.store.state.runs[TENANT].seen, ['redirect']);
     assert.equal(h.store.state.runs[TENANT].sent, 1);
+    assert.equal(h.store.state.runs[TENANT].lastCheckAlerts, 1);
     fail = false;
     await h.reload(); await h.poll(); await h.poll();
     assert.deepEqual(accepted.map(alert => alert.messages[0].id), ['redirect', 'unrelated', 'later']);
@@ -338,6 +339,7 @@ test('the independent heartbeat continues while message delivery blocks and the 
       h.sap.set(TENANT, [message('slow-delivery')]);
       checking = h.poll();
       await entered;
+      assert.equal(h.store.state.runs[TENANT].lastCheck, h.time);
       assert.deepEqual(h.tableClicks, [TENANT]);
       h.time += 180000;
       h.fireAlarm(HEARTBEAT_ALARM);
@@ -354,6 +356,30 @@ test('the independent heartbeat continues while message delivery blocks and the 
     return Response.json({ok: true});
   }});
 });
+
+test('status stays responsive during a stalled SAP check and failed checks never advance its timestamp', {timeout: 5000}, () => fixture(async h => {
+  await h.start();
+  const lastCheck = h.store.state.runs[TENANT].lastCheck;
+  h.time += 30 * 60000;
+  let release, entered;
+  const started = new Promise(resolve => {entered = resolve;});
+  const blocked = new Promise(resolve => {release = resolve;});
+  h.sap.set(TENANT, async () => {entered(); await blocked; return new Response('', {status: 503});});
+  const checking = h.poll();
+  try {
+    await started;
+    const status = await h.request('status');
+    assert.equal(status.value.runs[0].lastCheck, lastCheck);
+    assert.equal(status.value.runs[0].phase, 'Reading SAP messages');
+  } finally {release(); await checking;}
+  assert.equal(h.store.state.runs[TENANT].lastCheck, lastCheck);
+  await h.reload();
+  assert.equal((await h.request('status')).value.runs[0].lastCheck, lastCheck);
+  assert.ok(h.monitoring.every(update => update.lastCheck === lastCheck));
+  h.sap.set(TENANT, []);
+  await h.poll();
+  assert.equal(h.store.state.runs[TENANT].lastCheck, h.time);
+}));
 
 test('Stop waits for an in-flight independent heartbeat so it cannot rearm monitoring after cancellation', async () => {
   let release, entered, block = true;
@@ -438,3 +464,58 @@ test('a rejected relay key is not saved and its error is shown in relay health',
   assert.equal(status.relay.connected, false);
   assert.match(status.relay.error, /Invalid relay key/);
 }, {relayFetch: async () => Response.json({error: 'Invalid relay key'}, {status: 401})}));
+
+
+test('last-check alert counts are tenant-scoped, persist across reload and reset on a successful empty check', () => fixture(async h => {
+  await h.start(); await h.start(TRIAL_TENANT);
+  assert.equal(h.store.state.runs[TENANT].lastCheckAlerts, 0);
+  h.sap.set(TENANT, [message('one'), message('two')]);
+  h.sap.set(TRIAL_TENANT, [message('trial')]);
+  await h.poll();
+  assert.equal(h.store.state.runs[TENANT].lastCheckAlerts, 2);
+  assert.equal(h.store.state.runs[TRIAL_TENANT].lastCheckAlerts, 1);
+  await h.reload();
+  assert.equal((await h.request('status')).value.runs.find(run => run.tenant === TENANT).lastCheckAlerts, 2);
+  h.broken.add(TENANT);
+  await h.poll();
+  assert.equal(h.store.state.runs[TENANT].lastCheckAlerts, 2); // Failed SAP reads preserve the last check.
+  assert.equal(h.store.state.runs[TRIAL_TENANT].lastCheckAlerts, 0);
+  h.broken.delete(TENANT);
+  await h.poll();
+  assert.equal(h.store.state.runs[TENANT].lastCheckAlerts, 0);
+  assert.equal(h.store.state.runs[TENANT].sent, 2);
+}));
+
+
+test('reset cancels all relay leases, restores tabs and clears saved data, alarms and power request', () => fixture(async h => {
+  await h.start(); await h.start(TRIAL_TENANT);
+  h.sap.set(TENANT, [message('before-reset')]); await h.poll();
+  const tabs = Object.values(h.store.state.runs).map(run => run.tabId);
+  h.store.extraSetting = 'remove-me';
+  assert.equal((await h.request('reset')).ok, true);
+  assert.deepEqual(h.store, {});
+  assert.equal(h.alarms.size, 0);
+  assert.equal(h.awake, false);
+  assert.ok(tabs.every(id => h.tabs.get(id).autoDiscardable));
+  assert.equal(h.monitoring.filter(update => update.action === 'stop').length, 2);
+  assert.equal((await h.request('status')).value.runs.length, 0);
+  await h.reload();
+  assert.equal(h.store.relayToken, undefined);
+  assert.deepEqual(h.store.state.runs, {});
+  assert.equal(h.alarms.size, 0);
+}));
+
+test('reset retains cancellation data when the relay is offline and completes after reconnection', () => fixture(async h => {
+  await h.start();
+  h.monitorBroken = true;
+  const reset = await h.request('reset');
+  assert.equal(reset.ok, false);
+  assert.match(reset.error, /could not confirm cancellation/);
+  assert.equal(h.store.state.runs[TENANT].running, false);
+  assert.equal(h.store.state.pendingStops.length, 1);
+  assert.ok(h.store.relayToken);
+  await h.reload(); h.monitorBroken = false;
+  assert.equal((await h.request('reset')).ok, true);
+  assert.deepEqual(h.store, {});
+  assert.equal(h.alarms.size, 0);
+}));

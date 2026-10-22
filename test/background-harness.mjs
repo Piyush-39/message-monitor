@@ -30,7 +30,8 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
   const chrome = {
     storage: {local: {
       async get(key) {return {[key]: structuredClone(store[key])};},
-      async set(values) {Object.assign(store, structuredClone(values));}, async setAccessLevel() {}
+      async set(values) {Object.assign(store, structuredClone(values));}, async setAccessLevel() {},
+      async clear() {for (const key of Object.keys(store)) delete store[key];}
     }},
     tabs: {
       async query() {return [tabs.get(1)];},
@@ -76,7 +77,7 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
     }},
     alarms: {
       async create(name, options) {alarms.set(name, options);}, async get(name) {return alarms.get(name);},
-      async clear(name) {return alarms.delete(name);}, onAlarm: {addListener(listener) {onAlarm = listener;}}
+      async clear(name) {return alarms.delete(name);}, async clearAll() {alarms.clear(); return true;}, onAlarm: {addListener(listener) {onAlarm = listener;}}
     },
     action: {async setBadgeText() {}, async setBadgeBackgroundColor() {}},
     power: {requestKeepAwake() {keepAwake = true;}, releaseKeepAwake() {keepAwake = false;}},
@@ -115,7 +116,7 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
       if (!source) {source = {id: Math.max(...tabs.keys()) + 1, url: `${tenant}/shell/monitoring/Messages/`}; tabs.set(source.id, source);}
       return request('start', null, {sourceTabId: source.id});
     },
-    async poll(name = POLL_ALARM) {onAlarm({name}); return request('status');},
+    async poll(name = POLL_ALARM) {await onAlarm({name}); return request('status');},
     fireAlarm(name) {onAlarm({name});},
     close() {Date.now = originalNow; globalThis.chrome = originalChrome; globalThis.fetch = originalFetch;}
   };

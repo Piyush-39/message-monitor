@@ -18,7 +18,12 @@ async function popupHarness({url = `${TENANT}/shell/monitoring/Messages/`, saved
   const html = await readFile(new URL('../extension/popup.html', import.meta.url), 'utf8');
   const elements = Object.fromEntries([...html.matchAll(/<(\w+)[^>]*\bid="([^"]+)"/g)].map(([, tag, id]) => [id, element(tag, id)]));
   elements.token.type = 'password';
-  const previous = {document: globalThis.document, chrome: globalThis.chrome};
+  const previous = {document: globalThis.document, chrome: globalThis.chrome, setInterval: globalThis.setInterval};
+  const originalNow = Date.now;
+  let clock = originalNow();
+  Date.now = () => clock;
+  const intervals = [];
+  globalThis.setInterval = (callback, delay) => {intervals.push({callback, delay}); return intervals.length;};
   globalThis.document = {
     querySelector(selector) {return elements[selector.slice(1)];}, createElement: tag => element(tag),
     querySelectorAll() {return [...Object.values(elements), ...flatten(elements.runs)].filter(node => node.tag === 'button');}
@@ -35,8 +40,9 @@ async function popupHarness({url = `${TENANT}/shell/monitoring/Messages/`, saved
       if (message.type === 'updateStatuses') state.runs.find(run => run.tenant === message.tenant).emailStatuses = message.emailStatuses;
       if (message.type === 'stop') state.runs.find(run => run.tenant === message.tenant).running = false;
       if (message.type === 'connect') {savedToken = message.token; state.relay = {connected: true};}
+      if (message.type === 'reset') {savedToken = ''; state.runs = []; state.relay = {connected: false}; delete state.delivery; delete state.inactiveDeliveries;}
       state.activeCount = state.runs.filter(run => run.running).length;
-      if (message.type === 'status') return {ok: true, value: state};
+      if (message.type === 'status') return {ok: true, value: structuredClone(state)};
       return {ok: true, value: {status: message.type === 'test' ? 'Test queued' : 'Saved'}};
     }}
   };
@@ -44,14 +50,16 @@ async function popupHarness({url = `${TENANT}/shell/monitoring/Messages/`, saved
   await load();
   const inputs = () => flatten(elements['status-options']).filter(node => node.tag === 'input');
   return {elements, calls, state, inputs, load,
+    advance(ms) {clock += ms; intervals.filter(({delay}) => delay === 1000).forEach(({callback}) => callback());},
+    async refreshDelivery() {await Promise.all(intervals.filter(({delay}) => delay === 2000).map(({callback}) => callback()));},
     choose(statuses) {inputs().forEach(input => {input.checked = statuses.includes(input.value);}); inputs()[0].change();},
     grant(value) {granted = value;}, changed,
-    close() {Object.assign(globalThis, previous);}
+    close() {Date.now = originalNow; Object.assign(globalThis, previous);}
   };
 }
 
 test('popup starts a second tenant, persists selections and targets independent Open/Stop controls', async () => {
-  const initial = {tenant: TRIAL_TENANT, running: true, status: 'Watching', endsAt: null, sent: 3,
+  const initial = {tenant: TRIAL_TENANT, running: true, status: 'Watching', endsAt: null, sent: 3, lastCheckAlerts: 2,
     scope: {artifactIds: ['flow-a', 'flow-b'], packageId: 'package-a'}, emailStatuses: ['ESCALATED']};
   const h = await popupHarness({state: {runs: [initial], activeCount: 1, relay: {connected: true}}});
   try {
@@ -82,6 +90,8 @@ test('popup starts a second tenant, persists selections and targets independent 
     assert.ok(text(firstCard).includes(new URL(TRIAL_TENANT).hostname));
     assert.match(text(firstCard), /Monitoring: 2 selected iFlows\nPackage: package-a/);
     assert.match(text(firstCard), /Alert statuses: Escalated/);
+    assert.match(text(firstCard), /Alerts in last check\n2 alerts/);
+    assert.match(text(e.runs.children[1]), /Alerts in last check\nNot recorded/);
     assert.doesNotMatch(text(firstCard), /flow-a|flow-b|Ends:/);
     assert.match(text(firstCard), /No time limit/);
     const details = flatten(firstCard).find(node => node.textContent === 'Details ▾');
@@ -106,6 +116,11 @@ test('popup starts a second tenant, persists selections and targets independent 
     assert.equal(e.runs.children[0].className, firstCard.className);
     assert.match(e['delivery-status'].textContent, /Discord · 3 queued/);
     assert.match(e['delivery-status'].textContent, /Discord rate limit/);
+    state.delivery = {provider: 'teams', pending: 1, delivered: 4, errors: {teams: 'Teams rate limit; waiting to retry.'}};
+    await e.test.click();
+    assert.match(e['delivery-status'].textContent, /Teams · 1 queued · 4 accepted by workflow/);
+    assert.match(e['delivery-status'].textContent, /Teams rate limit/);
+    assert.doesNotMatch(e['delivery-status'].textContent, /4 delivered/);
     assert.match(text(e.runs.children[0]), /Monitoring: 1 selected iFlow\n/);
     assert.doesNotMatch(text(e.runs.children[0]), /only-flow/);
     initial.scope = {artifactIds: [], packageId: 'package-a'};
@@ -124,6 +139,50 @@ test('popup starts a second tenant, persists selections and targets independent 
     await currentStop.click();
     assert.equal(state.activeCount, 0);
     assert.equal(e.start.hidden, false);
+  } finally {h.close();}
+});
+
+test('last successful check keeps aging without storage updates and overdue checks need attention', async () => {
+  const lastCheck = Date.now() - 12000;
+  const h = await popupHarness({state: {runs: [
+    {tenant: TENANT, running: true, lastCheck},
+    {tenant: TRIAL_TENANT, running: false, lastCheck}
+  ], activeCount: 1, relay: {connected: true}}});
+  try {
+    const e = h.elements;
+    const card = e.runs.children[0];
+    const details = flatten(card).find(node => node.textContent === 'Details ▾');
+    await details.click();
+    const calls = h.calls.length;
+    assert.match(text(card), /12 seconds ago/);
+    h.advance(30 * 60000);
+    assert.equal(h.calls.length, calls); // The clock does not depend on a responsive worker/relay.
+    assert.equal(e.runs.children[0], card); // Keep focus and expanded details intact.
+    assert.equal(details.attributes['aria-expanded'], 'true');
+    assert.match(text(card), /30 minutes ago/);
+    assert.match(text(card), /Needs attention/);
+    assert.match(text(card), /SAP checks are overdue/);
+    assert.equal(e['tenant-state'].textContent, 'Needs attention');
+    assert.equal(e.attention.hidden, false);
+    assert.match(e.attention.textContent, /1 tenant needs attention/);
+    assert.match(text(e.runs.children[1]), /30 minutes ago/);
+    assert.doesNotMatch(text(e.runs.children[1]), /Needs attention|SAP checks are overdue/);
+    assert.equal(h.state.runs[0].lastCheck, lastCheck);
+    // A fresh successful check clears the local warning on the next render.
+    h.state.runs[0].lastCheck = Date.now();
+    await e.test.click();
+    assert.match(text(e.runs.children[0]), /Just now/);
+    assert.equal(e['tenant-state'].textContent, 'Monitoring');
+    assert.equal(e.attention.hidden, true);
+  } finally {h.close();}
+});
+
+test('a popup opened after checks stopped immediately shows the actual age and overdue warning', async () => {
+  const h = await popupHarness({state: {runs: [{tenant: TENANT, running: true, lastCheck: Date.now() - 30 * 60000}], activeCount: 1, relay: {connected: true}}});
+  try {
+    assert.match(text(h.elements.runs), /30 minutes ago/);
+    assert.match(text(h.elements.runs), /Needs attention/);
+    assert.equal(h.elements['tenant-state'].textContent, 'Needs attention');
   } finally {h.close();}
 });
 
@@ -185,4 +244,57 @@ test('multiple tenants still use optional site access without expanded install p
   assert.deepEqual(manifest.permissions, ['activeTab', 'alarms', 'storage', 'scripting', 'notifications', 'power']);
   assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1/*']);
   assert.deepEqual(manifest.optional_host_permissions, ['https://*/*']);
+});
+
+
+test('delivery progress refreshes without SAP storage changes or replacing focused tenant controls', async () => {
+  const h = await popupHarness({state: {runs: [{tenant: TENANT, running: true, sent: 3}], activeCount: 1,
+    relay: {connected: true}, delivery: {provider: 'discord', pending: 1, delivered: 2},
+    inactiveDeliveries: [{provider: 'teams', pending: 3, failed: 3}]}});
+  try {
+    const e = h.elements, card = e.runs.children[0];
+    const details = flatten(card).find(node => node.textContent === 'Details ▾');
+    await details.click();
+    await e['edit-statuses'].click();
+    h.choose(['FAILED']);
+    assert.match(e['delivery-status'].textContent, /1 queued/);
+    assert.match(e['delivery-status'].textContent, /Relay counts include queued/);
+    assert.match(e['delivery-status'].textContent, /Teams · 3 alerts in an inactive queue \(3 rejected\)/);
+    h.state.delivery.pending = 0; h.state.delivery.delivered = 3;
+    h.state.inactiveDeliveries = [];
+    await h.refreshDelivery();
+    assert.match(e['delivery-status'].textContent, /Discord · 0 queued · 3 delivered/);
+    assert.doesNotMatch(e['delivery-status'].textContent, /Waiting|Teams/);
+    assert.equal(e.runs.children[0], card);
+    assert.equal(details.attributes['aria-expanded'], 'true');
+    assert.equal(e['status-editor'].hidden, false);
+    assert.deepEqual(h.inputs().filter(input => input.checked).map(input => input.value), ['FAILED']);
+  } finally {h.close();}
+});
+
+
+test('reset requires confirmation, supports cancel and clears popup state after resetting', async () => {
+  const h = await popupHarness({state: {runs: [{tenant: TENANT, running: true, sent: 4}], activeCount: 1, relay: {connected: true}}});
+  try {
+    const e = h.elements;
+    h.choose(['FAILED']);
+    await e['show-token'].click();
+    await e['reset-data'].click();
+    assert.equal(e['reset-confirmation'].hidden, false);
+    assert.equal(h.calls.some(call => call.message?.type === 'reset'), false);
+    await e['cancel-reset'].click();
+    assert.equal(e['reset-confirmation'].hidden, true);
+    assert.equal(h.state.runs.length, 1);
+    await e['reset-data'].click();
+    await e['confirm-reset'].click();
+    assert.equal(h.calls.filter(call => call.message?.type === 'reset').length, 1);
+    assert.equal(e.token.value, '');
+    assert.equal(e.token.type, 'password');
+    assert.equal(e.runs.children.length, 0);
+    assert.equal(e['reset-confirmation'].hidden, true);
+    assert.equal(e['relay-settings'].hidden, false);
+    assert.equal(e.start.disabled, true);
+    assert.deepEqual(h.inputs().filter(input => input.checked).map(input => input.value), EMAIL_STATUSES);
+    assert.equal(e['reset-data'].disabled, false);
+  } finally {h.close();}
 });

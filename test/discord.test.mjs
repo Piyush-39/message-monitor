@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {discordConfig, webhookURL, verifyDiscordWebhook, discordMessage, createDiscordDelivery} from '../relay/discord.mjs';
 import {saveDiscordConfig} from '../relay/setup-discord.mjs';
-import {createRelay} from '../relay/server.mjs';
+import {createRelay, inactiveOutboxes} from '../relay/server.mjs';
 import {backgroundHarness, message, token} from './background-harness.mjs';
 import {TENANT, TRIAL_TENANT} from './fixtures.mjs';
 import {HEARTBEAT_TIMEOUT} from '../relay/monitor.mjs';
@@ -349,4 +349,22 @@ test('migration keeps old queued alerts and delivery receipts while removing arc
   assert.equal(Object.keys(saved.pending).length, 0);
   assert.equal(Object.keys(saved.receipts).length, 2);
   assert.ok(!('targets' in saved));
+}));
+
+
+test('health exposes queues stranded under inactive providers without leaking payloads', () => fixture(async f => {
+  const {writeFile} = await import('node:fs/promises');
+  const stateFile = join(f.folder, 'receipts.json');
+  await writeFile(`${stateFile}.teams`, JSON.stringify({pending: {one: {failed: true, payload: 'private SAP details'}, two: {}}}));
+  await writeFile(`${stateFile}.discord`, JSON.stringify({pending: {active: {}}}));
+  const server = await createRelay({token, discordDelivery: f.delivery, stateFile});
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/health`, {headers: {Authorization: `Bearer ${token}`}});
+    const health = await response.json();
+    assert.deepEqual(health.inactiveDeliveries, [{provider: 'teams', pending: 2, failed: 1}]);
+    assert.ok(!JSON.stringify(health).includes('private SAP details'));
+    await writeFile(`${stateFile}.teams`, '{broken');
+    assert.match((await inactiveOutboxes(stateFile, 'discord'))[0].error, /Could not read/);
+  } finally {await new Promise(resolve => server.close(resolve));}
 }));

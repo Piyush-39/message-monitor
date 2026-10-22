@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import nodemailer from 'nodemailer';
 import {messageEmail} from './email.mjs';
 import {discordConfig, createDiscordDelivery} from './discord.mjs';
+import {teamsConfig, createTeamsDelivery} from './teams.mjs';
 import { LEGACY_TENANT, isTenantOrigin } from '../extension/core.js';
 import {createMonitoringWatch, validateMonitor} from './monitor.mjs';
 
@@ -63,8 +64,25 @@ async function jsonBody(request, limit = 1000000) {
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
-export async function createRelay({token, user, recipient, transport, stateFile = '.relay-state.json', monitorFile = `${stateFile}.monitoring`, now = Date.now, discordDelivery}) {
-  if (!token || token.length < 32 || (!discordDelivery && (!EMAIL.test(user || '') || !EMAIL.test(recipient || '')))) throw new Error('Run npm run setup first.');
+// Inspect inactive providers too: switching providers does not drain their outboxes.
+export async function inactiveOutboxes(stateFile, activeProvider) {
+  return (await Promise.all(['discord', 'teams'].filter(provider => provider !== activeProvider).map(async provider => {
+    try {
+      const state = JSON.parse(await readFile(`${stateFile}.${provider}`, 'utf8'));
+      if (!state.pending || typeof state.pending !== 'object') throw new Error('Invalid outbox');
+      const jobs = Object.values(state.pending);
+      return jobs.length ? {provider, pending: jobs.length, failed: jobs.filter(job => job.failed).length} : null;
+    } catch (error) {
+      return error.code === 'ENOENT' ? null : {provider, error: 'Could not read the inactive notification queue. Check the relay terminal and saved outbox.'};
+    }
+  }))).filter(Boolean);
+}
+export async function createRelay({token, user, recipient, transport, stateFile = '.relay-state.json', monitorFile = `${stateFile}.monitoring`, now = Date.now, delivery: configuredDelivery, discordDelivery}) {
+  // Keep the previous injected Discord option compatible with existing callers.
+  const delivery = configuredDelivery || discordDelivery;
+  const deliveryProvider = delivery?.status().provider;
+  const deliveryLabel = deliveryProvider === 'teams' ? 'Teams' : 'Discord';
+  if (!token || token.length < 32 || (!delivery && (!EMAIL.test(user || '') || !EMAIL.test(recipient || '')))) throw new Error('Run npm run setup first.');
   let receipts = {};
   try { receipts = JSON.parse(await readFile(stateFile, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -91,10 +109,10 @@ export async function createRelay({token, user, recipient, transport, stateFile 
       !receipts[`message:${alert.tenant}:${message.id}`] && !(alert.tenant === LEGACY_TENANT && receipts[`message:${message.id}`])
     )} : alert;
     if (isMessageBatch && !filtered.messages.length) return {ok: true, duplicate: true};
-    if (discordDelivery) {
+    if (delivery) {
       // The outbox must be durable before acknowledging this message to Chrome.
       // Queue deduplication also protects a retry if the receipt write below fails.
-      await discordDelivery.enqueue(filtered);
+      await delivery.enqueue(filtered);
     } else {
       const mail = composeEmail(filtered);
       const info = await transport.sendMail({from: user, to: recipient, ...mail});
@@ -104,7 +122,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     if (isMessageBatch) for (const message of filtered.messages) receipts[`message:${alert.tenant}:${message.id}`] = Date.now();
     await writeFile(`${stateFile}.tmp`, JSON.stringify(receipts), {mode: 0o600});
     await rename(`${stateFile}.tmp`, stateFile);
-    return {ok: true, ...(discordDelivery ? {queued: true, provider: 'discord'} : {})};
+    return {ok: true, ...(delivery ? {queued: true, provider: deliveryProvider} : {})};
   }
   const monitor = await createMonitoringWatch({stateFile: monitorFile, sendAlert: alert => serialize(() => deliver(alert)), now});
   function monitorOperation(operation) {
@@ -128,7 +146,10 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     const supplied = Buffer.from(request.headers.authorization || '');
     const expected = Buffer.from(`Bearer ${token}`);
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return reply(401, {error: 'Invalid relay key'});
-    if (request.method === 'GET' && request.url === '/health') return reply(200, {ok: true, ...(discordDelivery ? {delivery: discordDelivery.status()} : {})});
+    if (request.method === 'GET' && request.url === '/health') {
+      const inactiveDeliveries = await inactiveOutboxes(stateFile, deliveryProvider);
+      return reply(200, {ok: true, ...(delivery ? {delivery: delivery.status()} : {}), ...(inactiveDeliveries.length ? {inactiveDeliveries} : {})});
+    }
     if (request.method !== 'POST' || !['/alert', '/monitor'].includes(request.url)) return reply(404, {error: 'Not found'});
     let alert;
     try {
@@ -142,7 +163,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     catch (error) {
       // Do not log SMTP credentials, message bodies, or provider responses.
       console.error('Notification delivery failed:', error.code || 'DELIVERY_ERROR');
-      return reply(502, {error: discordDelivery ? 'Could not save the Discord alert. Check relay disk access and the relay terminal.' : 'Email delivery failed. Check the Gmail app password and relay terminal.'});
+      return reply(502, {error: delivery ? `Could not save the ${deliveryLabel} alert. Check relay disk access and the relay terminal.` : 'Email delivery failed. Check the Gmail app password and relay terminal.'});
     }
   });
   server.requestTimeout = 15000;
@@ -151,21 +172,23 @@ export async function createRelay({token, user, recipient, transport, stateFile 
   server.notifyShutdown = () => monitorOperation(() => monitor.shutdown());
   let timer;
   server.once('listening', () => {
-    discordDelivery?.start();
+    delivery?.start();
     server.checkMonitoring().catch(error => console.error('Monitoring check failed:', error.code || 'MONITOR_ERROR'));
     timer = setInterval(() => server.checkMonitoring().catch(error => console.error('Monitoring check failed:', error.code || 'MONITOR_ERROR')), 30000);
     timer.unref();
   });
-  server.once('close', () => {clearInterval(timer); discordDelivery?.stop();});
+  server.once('close', () => {clearInterval(timer); delivery?.stop();});
   return server;
 }
 async function main() {
   const {SMTP_USER: user, SMTP_PASS: pass, ALERT_TO: recipient = user, RELAY_TOKEN: token} = process.env;
   const provider = process.env.NOTIFICATION_PROVIDER || 'email';
-  if (!['email', 'discord'].includes(provider)) throw new Error('NOTIFICATION_PROVIDER must be email or discord.');
-  let transport, discordDelivery;
+  if (!['email', 'discord', 'teams'].includes(provider)) throw new Error('NOTIFICATION_PROVIDER must be email, discord or teams.');
+  let transport, delivery;
   if (provider === 'discord') {
-    discordDelivery = await createDiscordDelivery({...discordConfig(process.env), stateFile: '.relay-state.json.discord'});
+    delivery = await createDiscordDelivery({...discordConfig(process.env), stateFile: '.relay-state.json.discord'});
+  } else if (provider === 'teams') {
+    delivery = await createTeamsDelivery({...teamsConfig(process.env), stateFile: '.relay-state.json.teams'});
   } else {
     if (!pass || !/^[a-zA-Z0-9]{16}$/.test(pass.replace(/\s/g, ''))) throw new Error('Set SMTP_PASS in .env to your 16-character Gmail app password.');
     transport = nodemailer.createTransport({
@@ -173,10 +196,10 @@ async function main() {
       auth: {user, pass: pass.replace(/\s/g, '')},
       connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000
     });
-    // Email mode checks login without sending. Discord mode does not contact Gmail.
+    // Email mode checks login without sending. Webhook modes do not contact Gmail.
     await transport.verify();
   }
-  const server = await createRelay({token, user, recipient, transport, discordDelivery});
+  const server = await createRelay({token, user, recipient, transport, delivery});
   let shuttingDown = false;
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
     if (shuttingDown) return;
@@ -186,15 +209,15 @@ async function main() {
     deadline.unref();
     try {
       await server.notifyShutdown();
-      if (discordDelivery) await discordDelivery.flush();
+      if (delivery) await delivery.flush();
     } catch (error) {console.error('Shutdown notice could not be sent:', error.code || 'MONITOR_ERROR');}
-    discordDelivery?.stop();
+    delivery?.stop();
     server.close();
     server.closeIdleConnections();
     transport?.close();
     process.exit(0);
   });
-  server.listen(43171, '127.0.0.1', () => console.log(provider === 'discord' ? 'Discord relay ready at http://127.0.0.1:43171. All alerts use the configured Discord channel.' : `Email relay ready at http://127.0.0.1:43171. Alerts go to ${recipient}.`));
+  server.listen(43171, '127.0.0.1', () => console.log(delivery ? `${provider === 'teams' ? 'Teams' : 'Discord'} relay ready at http://127.0.0.1:43171. All alerts use the configured ${provider === 'teams' ? 'Teams workflow' : 'Discord channel'}.` : `Email relay ready at http://127.0.0.1:43171. Alerts go to ${recipient}.`));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(error => {

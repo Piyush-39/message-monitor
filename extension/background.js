@@ -1,4 +1,4 @@
-import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, emailStatuses, DURATION, POLL_ALARM, HEARTBEAT_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
+import { monitorTenant, monitorSelection, isTenantOrigin, monitoringState, emailStatuses, POLL_ALARM, HEARTBEAT_ALARM, END_ALARM, endAlarm, unseenMessages, activeRun } from './core.js';
 import { readNonCompletedMessages, readMessageErrors, refreshMessageTable } from './poll.js';
 
 const RELAY = 'http://127.0.0.1:43171';
@@ -114,7 +114,6 @@ async function start(token, sourceTabId, selectedStatuses) {
   if (!tenant) throw new Error('Open your IS Monitor Message Processing page in this Chrome profile first.');
   if (activeRun(state.runs[tenant])) throw new Error('This tenant is already running. Other tenants can be added from their monitor tabs.');
   const {filter, scope} = monitorSelection(source.url);
-  if (state.runs[tenant]?.running) await stop(tenant, 'Nine-hour run finished');
   await relay('/health', token);
   const baseline = await read({tenant, tabId: source.id, scope, emailStatuses: statuses}, Date.now() - 60 * 60 * 1000);
   const watchdogFilter = {...filter, status: 'ALL', time: 'PASTHOUR'};
@@ -123,7 +122,7 @@ async function start(token, sourceTabId, selectedStatuses) {
   await chrome.tabs.update(tab.id, {autoDiscardable: false});
   const startedAt = Date.now();
   const run = {
-    running: true, token, tenant, scope, emailStatuses: statuses, tabId: tab.id, startedAt, endsAt: startedAt + DURATION,
+    running: true, token, tenant, scope, emailStatuses: statuses, tabId: tab.id, startedAt, endsAt: null,
     seen: baseline.map(message => message.id), sent: 0, lastCheck: startedAt,
     status: 'Watching', phase: 'Waiting for next check', problem: null, problemEpisode: null, restoreAutoDiscardable
   };
@@ -131,7 +130,6 @@ async function start(token, sourceTabId, selectedStatuses) {
   await save();
   try {
     await heartbeat(run, 'start');
-    await chrome.alarms.create(endAlarm(tenant), {when: run.endsAt});
     await updateControls();
   } catch (error) {
     run.problem = String(error.message || error).slice(0, 400);
@@ -142,7 +140,7 @@ async function start(token, sourceTabId, selectedStatuses) {
   return {status: 'Watching', tenant};
 }
 async function tick(run) {
-  if (!activeRun(run)) {if (run.running) await stop(run.tenant, 'Nine-hour run finished'); return;}
+  if (!activeRun(run)) return;
   try {
     const deadline = Date.now() + 45000;
     run.phase = 'Reading SAP messages';
@@ -158,14 +156,14 @@ async function tick(run) {
     run.pendingAlerts = fresh.length;
     delivery: for (let offset = 0; offset < fresh.length; offset += 50) {
       if (Date.now() >= deadline) break;
-      if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
+      if (!activeRun(run)) return;
       run.phase = 'Reading SAP error details';
       const batch = await withErrorDetails(run, fresh.slice(offset, offset + 50));
-      if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
+      if (!activeRun(run)) return;
       // Gmail filters the entire email, so unrelated SAP messages must never share one.
       for (const message of batch) {
         if (Date.now() >= deadline) break delivery;
-        if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
+        if (!activeRun(run)) return;
         run.phase = 'Handing message alerts to notification relay';
         await relay('/alert', run.token, {kind: 'messages', run: run.startedAt, tenant: run.tenant, messages: [message]});
         run.seen.push(message.id);
@@ -174,7 +172,7 @@ async function tick(run) {
         await save();
       }
     }
-    if (!activeRun(run)) {await stop(run.tenant, 'Nine-hour run finished'); return;}
+    if (!activeRun(run)) return;
     run.phase = 'Waiting for next check';
     await heartbeat(run, 'heartbeat', 'healthy');
     run.problem = null;
@@ -212,7 +210,7 @@ async function tickAll() {
 function publicState() {
   const runs = Object.values(state.runs).map(({token, seen, ...run}) => ({...run, running: activeRun(run),
     emailStatuses: emailStatuses(run.emailStatuses),
-    status: run.running && !activeRun(run) ? 'Nine-hour run finished' : run.status}));
+    status: run.status}));
   return {runs, activeCount: runs.filter(run => activeRun(run)).length};
 }
 chrome.alarms.onAlarm.addListener(alarm => {
@@ -232,12 +230,8 @@ chrome.alarms.onAlarm.addListener(alarm => {
     return;
   }
   serialize(async () => {
-    if (alarm.name === POLL_ALARM || alarm.name === END_ALARM) return tickAll();
-    if (alarm.name.startsWith(`${END_ALARM}:`)) {
-      const tenant = alarm.name.slice(END_ALARM.length + 1);
-      // A queued alarm from an older run must not end a newly started run for the same tenant.
-      if (state.runs[tenant]?.running && !activeRun(state.runs[tenant])) return stop(tenant, 'Nine-hour run finished');
-    }
+    if (alarm.name === POLL_ALARM) return tickAll();
+    // Ignore end alarms already queued by an earlier extension version.
   }).catch(console.error);
 });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
@@ -245,16 +239,26 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   serialize(async () => {
     if (message.type === 'status') {
       const summary = publicState();
+      summary.relay = {connected: false, error: 'Add your notification relay key in Relay settings.'};
       const token = message.token || (await chrome.storage.local.get('relayToken')).relayToken || Object.values(state.runs)[0]?.token;
       if (token) {
         try {
           const health = await relay('/health', token);
+          summary.relay = {connected: true};
           if (health.delivery?.provider === 'discord') summary.delivery = health.delivery;
-        } catch {summary.delivery = {error: 'Notification relay unavailable. Keep npm start running.'};}
+        } catch (error) {
+          summary.relay = {connected: false, error: error.message};
+          summary.delivery = {error: error.message};
+        }
       }
       return summary;
     }
     if (message.type === 'start') return start(message.token, message.sourceTabId, message.emailStatuses);
+    if (message.type === 'connect') {
+      await relay('/health', message.token);
+      await chrome.storage.local.set({relayToken: message.token});
+      return {status: 'Notification relay connected. Key saved.'};
+    }
     if (message.type === 'updateStatuses') {
       const run = state.runs[message.tenant];
       if (!activeRun(run)) throw new Error('Start monitoring this tenant first.');
@@ -286,6 +290,7 @@ serialize(async () => {
   await save();
   await chrome.alarms.clear(END_ALARM); // Retire the single-run alarm after migration.
   for (const run of Object.values(state.runs)) {
+    await chrome.alarms.clear(endAlarm(run.tenant));
     if (activeRun(run)) {
       try {
         const tab = await chrome.tabs.get(run.tabId);
@@ -294,9 +299,10 @@ serialize(async () => {
           await chrome.tabs.update(run.tabId, {autoDiscardable: false});
         }
       } catch { /* The next poll reports the missing tab with its recovery steps. */ }
-      await chrome.alarms.create(endAlarm(run.tenant), {when: run.endsAt});
+      // Migrate relay deadlines without holding up the popup or other tenants.
+      const task = heartbeat(run).catch(() => {}).finally(() => heartbeatTasks.delete(run.tenant));
+      heartbeatTasks.set(run.tenant, task);
     }
-    else if (run.running) await stop(run.tenant, 'Nine-hour run finished');
   }
   await save();
   await updateControls();

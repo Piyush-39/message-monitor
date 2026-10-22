@@ -47,7 +47,7 @@ export function composeEmail(alert) {
   };
   if (alert.kind === 'problem') return {
     subject: `IS Watchdog: monitoring needs attention — ${new URL(alert.tenant).hostname}`,
-    text: `Monitoring cannot currently confirm new non-Completed messages.\n\n${alert.problem}\n\nOpen the watchdog tab and sign in again if needed. Checks will retry every minute until the nine-hour run ends.\n\n${alert.tenant}/shell/monitoring`
+    text: `Monitoring cannot currently confirm new non-Completed messages.\n\n${alert.problem}\n\nOpen the watchdog tab and sign in again if needed. Checks retry every minute until you stop monitoring.\n\n${alert.tenant}/shell/monitoring`
   };
   if (alert.messages.length !== 1) throw new Error('Compose one SAP message per email.');
   return messageEmail(alert.tenant, alert.messages[0]);

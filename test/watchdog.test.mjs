@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readNonCompletedMessages } from '../extension/poll.js';
-import { unseenMessages, activeRun, DURATION, monitorTenant, monitorSelection, isTenantOrigin } from '../extension/core.js';
+import { unseenMessages, activeRun, monitorTenant, monitorSelection, isTenantOrigin } from '../extension/core.js';
 import { TENANT, TRIAL_TENANT, OTHER_TENANTS } from './fixtures.mjs';
 import { createRelay, composeEmail } from '../relay/server.mjs';
 
@@ -141,9 +141,10 @@ test('rejects pagination loops and links outside the tenant', async () => {
 test('deduplicates IDs while preserving distinct failures in the same flow/time', () => {
   const messages = [item('old'), item('new'), item('new'), item('other')].map(value => ({id: value.MessageGuid}));
   assert.deepEqual(unseenMessages(messages, ['old']).map(value => value.id), ['new', 'other']);
-  assert.equal(DURATION, 9 * 3600000);
   assert.equal(activeRun({running: true, endsAt: 100}, 99), true);
-  assert.equal(activeRun({running: true, endsAt: 100}, 100), false);
+  assert.equal(activeRun({running: true, endsAt: 100}, 100), true);
+  assert.equal(activeRun({running: true, endsAt: null}, 30 * 86400000), true);
+  assert.equal(activeRun({running: false, endsAt: null}), false);
 });
 test('recognizes any HTTPS tenant monitor URL and rejects invalid pages/schemes/credentials', () => {
   for (const tenant of [TENANT, TRIAL_TENANT, ...OTHER_TENANTS]) assert.equal(monitorTenant(`${tenant}/shell/monitoring/Messages/%7B%7D`), tenant);

@@ -1,12 +1,14 @@
 import {readFile, writeFile, rename} from 'node:fs/promises';
-import {isTenantOrigin, DURATION} from '../extension/core.js';
+import {isTenantOrigin} from '../extension/core.js';
 
 export const HEARTBEAT_TIMEOUT = 3 * 60 * 1000;
 export function validateMonitor(value) {
   if (!value || !isTenantOrigin(value.tenant) || !Number.isSafeInteger(value.run) || value.run < 0 ||
       !['start', 'heartbeat', 'stop'].includes(value.action)) throw new Error('Invalid monitoring update');
-  if (value.action !== 'stop' && (value.endsAt !== value.run + DURATION || !Number.isSafeInteger(value.lastCheck) ||
-      value.lastCheck < value.run || value.lastCheck > value.endsAt || !['healthy', 'problem'].includes(value.status))) throw new Error('Invalid monitoring window');
+  // Finite windows remain supported for older extensions during an upgrade.
+  if (value.action !== 'stop' && ((value.endsAt !== null && (!Number.isSafeInteger(value.endsAt) || value.endsAt < value.run)) ||
+      !Number.isSafeInteger(value.lastCheck) || value.lastCheck < value.run ||
+      (value.endsAt !== null && value.lastCheck > value.endsAt) || !['healthy', 'problem'].includes(value.status))) throw new Error('Invalid monitoring window');
   if (value.problem != null && (typeof value.problem !== 'string' || value.problem.length > 400)) throw new Error('Invalid monitoring problem');
   if (value.phase != null && (typeof value.phase !== 'string' || value.phase.length > 100)) throw new Error('Invalid monitoring phase');
   return value;
@@ -27,10 +29,11 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
     return result;
   }
   function missedHeartbeat(lease) {
-    if (lease.notice || Math.min(now(), lease.endsAt) - lease.lastContact < HEARTBEAT_TIMEOUT) return;
+    const checkedUntil = lease.endsAt == null ? now() : Math.min(now(), lease.endsAt);
+    if (lease.notice || checkedUntil - lease.lastContact < HEARTBEAT_TIMEOUT) return;
     const time = value => new Date(value).toLocaleString('en-GB', {timeZone: 'Asia/Kolkata', hour12: false}) + ' IST';
     lease.notice = {episode: lease.lastContact, sent: false, problem: [
-      `Reason: the relay received no extension heartbeat for ${Math.floor((Math.min(now(), lease.endsAt) - lease.lastContact) / 60000)} minutes.`,
+      `Reason: the relay received no extension heartbeat for ${Math.floor((checkedUntil - lease.lastContact) / 60000)} minutes.`,
       `Last heartbeat: ${time(lease.lastContact)}. Last successful SAP check: ${time(lease.lastCheck)}.`,
       `Last activity: ${lease.phase || 'not recorded by this extension version'}.`,
       lease.problem ? `Last reported problem: ${lease.problem}` : `Last reported state: ${lease.status}.`,
@@ -71,7 +74,7 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
         }
         try {await sendNotice(lease);}
         catch { /* SMTP outage: keep the notice and retry on the next check/restart. */ }
-        if (now() >= lease.endsAt && (!lease.notice || lease.notice.sent)) {
+        if (lease.endsAt != null && now() >= lease.endsAt && (!lease.notice || lease.notice.sent)) {
           delete leases[key];
           await save();
         }
@@ -79,7 +82,7 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
     },
     async shutdown() {
       for (const lease of Object.values(leases)) {
-        if (now() >= lease.endsAt) continue;
+        if (lease.endsAt != null && now() >= lease.endsAt) continue;
         lease.notice ||= {episode: now(), sent: false,
           problem: 'The local notification relay is stopping while this tenant is being monitored. Restart the relay to restore alerts.'};
         await save();

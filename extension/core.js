@@ -24,7 +24,6 @@ export function monitorSelection(url) {
   if (filter.packageId !== undefined && (typeof filter.packageId !== 'string' || filter.packageId.length > 512)) throw new Error('Cannot read the selected package.');
   return {filter, scope: {artifactIds: [...new Set(ids)], packageId: filter.packageId && filter.packageId !== 'ALL' ? filter.packageId : null}};
 }
-export const DURATION = 9 * 60 * 60 * 1000;
 export const EMAIL_STATUSES = ['FAILED', 'RETRY', 'PROCESSING', 'ESCALATED', 'CANCELLED', 'DISCARDED', 'ABANDONED'];
 export const statusLabel = status => status[0] + status.slice(1).toLowerCase();
 export function emailStatuses(value = EMAIL_STATUSES) {
@@ -35,15 +34,20 @@ export function emailStatuses(value = EMAIL_STATUSES) {
 }
 export const POLL_ALARM = 'is-watchdog-poll';
 export const HEARTBEAT_ALARM = 'is-watchdog-heartbeat';
+// Retained only to clear alarms created by earlier versions.
 export const END_ALARM = 'is-watchdog-end';
 export const endAlarm = tenant => `${END_ALARM}:${tenant}`;
 
 export function monitoringState(saved) {
-  if (saved?.version === 2) return saved;
+  if (saved?.version === 2) {
+    // Remove old deadlines without restarting runs or losing their baseline.
+    for (const run of Object.values(saved.runs)) if (run.running) run.endsAt = null;
+    return saved;
+  }
   const runs = {};
   if (saved?.startedAt) {
     const tenant = saved.tenant || LEGACY_TENANT;
-    runs[tenant] = {...saved, tenant};
+    runs[tenant] = {...saved, tenant, ...(saved.running ? {endsAt: null} : {})};
   }
   return {version: 2, runs, pendingStops: []};
 }
@@ -57,6 +61,6 @@ export function unseenMessages(messages, seen) {
   });
 }
 
-export function activeRun(state, now = Date.now()) {
-  return Boolean(state?.running && now < state.endsAt);
+export function activeRun(state) {
+  return Boolean(state?.running);
 }

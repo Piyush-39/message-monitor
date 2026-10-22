@@ -1,14 +1,66 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>IS Message Watchdog</title><link rel="stylesheet" href="popup.css"></head>
-<body><h1>IS Message Watchdog</h1>
-<p>Choose which message statuses to notify you about for your selected artifacts. Each tenant is checked every minute for nine hours.</p>
-<label for="token">Local notification relay key</label>
-<input id="token" type="password" placeholder="From npm run setup" autocomplete="off">
-<fieldset id="email-statuses" aria-describedby="status-hint"><legend>Notify for these statuses</legend><div id="status-options"></div></fieldset>
-<p id="status-hint" class="hint">Choose at least one. Completed is always excluded. Changes apply to this tenant when you click Start or Save statuses.</p>
-<div class="actions"><button id="start">Start this tenant</button><button id="test" class="secondary">Send test notification</button></div>
-<p id="status" role="status" aria-live="polite">Loading…</p>
-<p id="delivery-status" class="hint" role="status" aria-live="polite"></p>
-<div id="runs" aria-label="Tenant monitoring runs"></div>
-<p class="hint">Open each tenant's Monitor Message Processing page and click Start. Keep Chrome and the relay running. Missing heartbeats trigger an alert after three minutes.</p>
-<script type="module" src="popup.js"></script></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>IS Message Watchdog</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3 4.5 6v5.5c0 4.4 4 7.7 7.5 9.5 3.5-1.8 7.5-5.1 7.5-9.5V6Z"/><path d="m7.5 12 3 3 6-6"/></svg></span>
+      <h1>IS Message Watchdog</h1>
+    </div>
+    <p class="cadence"><span class="dot" aria-hidden="true"></span>Every minute <span class="separator">·</span><strong>Runs until you stop it</strong></p>
+  </header>
+  <nav class="view-tabs" aria-label="Popup sections">
+    <button id="monitoring-tab" type="button" aria-pressed="true" aria-controls="monitoring-view">Monitoring</button>
+    <button id="relay-tab" type="button" aria-pressed="false" aria-controls="relay-settings">Relay settings</button>
+  </nav>
+  <div id="popup-content" class="scroll-area">
+    <div id="monitoring-view">
+    <main class="main">
+      <div class="section-label">Current tenant</div>
+      <section class="tenant" aria-label="Current tenant">
+        <div class="tenant-top"><h2 id="tenant-name">Detecting tenant…</h2><span id="tenant-state" class="pill">Loading</span></div>
+        <p id="tenant-help"></p>
+      </section>
+      <div id="status-editor">
+        <div class="section-row"><h2 id="statuses-heading">Notify me when a message is <span id="selected-count" class="muted"></span></h2><button id="select-all" class="link" type="button">Clear all</button></div>
+        <fieldset id="email-statuses" aria-labelledby="statuses-heading" aria-describedby="status-hint"><div id="status-options"></div></fieldset>
+        <p id="status-hint" class="hint">Select at least one status. Completed messages are excluded.</p>
+      </div>
+      <div id="status-summary" class="section-row" hidden><span id="status-summary-text"></span><button id="edit-statuses" class="link" type="button">Edit statuses</button></div>
+      <button id="start" class="primary" type="button" disabled>Start monitoring</button>
+      <p id="start-hint" class="hint" hidden></p>
+      <p id="status" role="status" aria-live="polite" hidden></p>
+    </main>
+    <section class="monitoring" aria-labelledby="runs-heading">
+      <div class="section-row"><h2 id="runs-heading">Monitored tenants</h2><span id="active-count" class="muted">Loading…</span></div>
+      <p id="attention" class="attention" hidden></p>
+      <p id="empty" class="hint" hidden>No tenants running yet. Start monitoring above.</p>
+      <div id="runs" aria-label="Tenant monitoring runs"></div>
+    </section>
+    </div>
+    <section id="relay-settings" class="settings-panel" aria-labelledby="relay-settings-heading" hidden>
+      <h2 id="relay-settings-heading">Notification relay settings</h2>
+      <p class="settings-description">Keep the local relay running with <code>npm start</code>, then connect below.</p>
+      <div class="settings-card">
+        <label for="token">Notification relay key</label>
+        <p id="token-help" class="hint">Paste the key printed by <code>npm run setup</code>.</p>
+        <input id="token" type="password" placeholder="Paste your relay key" autocomplete="off" spellcheck="false" aria-describedby="token-help">
+        <div class="key-actions"><button id="show-token" class="secondary" type="button" aria-label="Show relay key" aria-pressed="false">Show key</button><button id="check-relay" class="primary" type="button">Connect relay</button></div>
+        <p class="hint">Connect validates and saves the key. Use <strong>Send test</strong> below to check notification delivery.</p>
+      </div>
+      <p id="relay-notice" role="status" aria-live="polite" hidden></p>
+    </section>
+  </div>
+  <section class="connection" aria-label="Notification relay">
+    <div class="connection-row"><span id="relay-state" class="relay-state"><span class="dot" aria-hidden="true"></span><span id="relay-label">Checking notification relay…</span></span><button id="test" class="link" type="button">Send test</button></div>
+    <p id="delivery-status" class="hint" role="status" aria-live="polite" hidden></p>
+  </section>
+  <footer>Keep Chrome, the watchdog tab, and the local relay running.<br>Missing heartbeats trigger an alert after 3 minutes.</footer>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

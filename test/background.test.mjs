@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {TENANT, TRIAL_TENANT, OTHER_TENANTS} from './fixtures.mjs';
-import {DURATION, POLL_ALARM, HEARTBEAT_ALARM, END_ALARM, endAlarm, EMAIL_STATUSES} from '../extension/core.js';
+import {POLL_ALARM, HEARTBEAT_ALARM, END_ALARM, endAlarm, EMAIL_STATUSES} from '../extension/core.js';
 import {backgroundHarness, message} from './background-harness.mjs';
 const legacyStart = Date.now();
+const LEGACY_DURATION = 9 * 3600000;
 
 async function fixture(action, options) {
   const h = await backgroundHarness(options);
@@ -90,7 +91,10 @@ test('two tenants have independent baselines, counters, links and delivery dedup
   assert.equal((await h.start(TRIAL_TENANT)).ok, true);
   assert.equal((await h.start()).ok, false);
   assert.equal(h.alarms.get(POLL_ALARM).periodInMinutes, 1);
-  for (const tenant of [TENANT, TRIAL_TENANT]) assert.equal(h.alarms.get(endAlarm(tenant)).when, h.time + DURATION);
+  for (const tenant of [TENANT, TRIAL_TENANT]) {
+    assert.equal(h.alarms.has(endAlarm(tenant)), false);
+    assert.equal(h.store.state.runs[tenant].endsAt, null);
+  }
   h.sap.set(TENANT, [message('old-a'), message('same-id'), message('same-id')]);
   h.sap.set(TRIAL_TENANT, [message('old-b'), message('same-id')]);
   h.time += 60000;
@@ -131,22 +135,28 @@ test('a slow tenant does not hold up another tenant check', () => fixture(async 
   await checking;
   assert.deepEqual(Object.values(h.store.state.runs).map(run => run.sent), [1, 1]);
 }));
-test('Stop and nine-hour expiry affect only the selected tenant', () => fixture(async h => {
+test('tenants continue beyond nine hours and Stop affects only the selected tenant', () => fixture(async h => {
   await h.start();
   h.time += 60000;
   await h.start(TRIAL_TENANT);
-  const firstEnd = h.store.state.runs[TENANT].endsAt;
-  h.time = firstEnd;
-  await h.poll(endAlarm(TENANT));
-  assert.equal(h.store.state.runs[TENANT].running, false);
+  h.time += 3 * 24 * 3600000;
+  h.sap.set(TENANT, [message('after-three-days')]);
+  await h.poll(endAlarm(TENANT)); // Old queued expiry alarms are ignored.
+  await h.poll();
+  assert.equal(h.store.state.runs[TENANT].running, true);
+  assert.equal(h.store.state.runs[TRIAL_TENANT].running, true);
+  assert.equal(h.store.state.runs[TENANT].sent, 1);
+  await h.reload();
+  assert.equal((await h.request('status')).value.activeCount, 2);
+  await h.request('stop', TENANT);
   assert.equal(h.store.state.runs[TRIAL_TENANT].running, true);
   assert.equal(h.alarms.has(POLL_ALARM), true);
   assert.equal(h.awake, true);
   await h.request('stop', TRIAL_TENANT);
   assert.equal(h.awake, false);
   assert.equal(h.alarms.has(POLL_ALARM), false);
-  assert.equal(h.delivered.length, 0);
   assert.equal(h.monitoring.filter(item => item.action === 'stop').length, 2);
+  assert.ok(h.monitoring.filter(item => item.action !== 'stop').every(item => item.endsAt === null));
 }));
 test('failed email deliveries retry, and missing UI refresh does not disable monitoring', () => fixture(async h => {
   await h.start(); h.sap.set(TENANT, [message('retry')]);
@@ -192,7 +202,7 @@ test('Open targets each tenant watchdog tab and a closed tab generates a problem
   assert.equal(h.delivered[0].tenant, TENANT);
   assert.equal(h.store.state.runs[TRIAL_TENANT].status, 'Watching');
 }));
-test('migrates the legacy run and restores tenant alarms after worker restart', () => fixture(async h => {
+test('migrates a legacy run to unlimited monitoring and restores polling after worker restart', () => fixture(async h => {
   assert.equal(h.store.state.version, 2);
   assert.equal(h.store.state.runs[TENANT].sent, 7);
   assert.deepEqual(h.store.state.runs[TENANT].seen, ['already-sent']);
@@ -201,11 +211,13 @@ test('migrates the legacy run and restores tenant alarms after worker restart', 
   await h.start(TRIAL_TENANT);
   h.alarms.clear();
   await h.reload();
-  assert.equal(h.alarms.has(endAlarm(TENANT)), true);
-  assert.equal(h.alarms.has(endAlarm(TRIAL_TENANT)), true);
+  assert.equal(h.alarms.has(endAlarm(TENANT)), false);
+  assert.equal(h.alarms.has(endAlarm(TRIAL_TENANT)), false);
   assert.equal(h.alarms.has(POLL_ALARM), true);
   assert.equal(h.store.state.runs[TENANT].sent, 7);
-}, {saved: {running: true, token: 'a'.repeat(64), tabId: 1, startedAt: legacyStart, endsAt: legacyStart + DURATION,
+  assert.equal(h.store.state.runs[TENANT].endsAt, null);
+  assert.ok(h.monitoring.some(item => item.tenant === TENANT && item.endsAt === null));
+}, {saved: {running: true, token: 'a'.repeat(64), tabId: 1, startedAt: legacyStart, endsAt: legacyStart + LEGACY_DURATION,
   lastCheck: legacyStart, seen: ['already-sent'], sent: 7, status: 'Watching'}}));
 test('an old queued end alarm cannot stop a restarted tenant', () => fixture(async h => {
   await h.start(); await h.request('stop', TENANT);
@@ -393,3 +405,36 @@ test('slow handoffs yield to the next SAP check and retry every unsent ID withou
     return Response.json({ok: true});
   }});
 });
+
+test('existing version-2 runs lose deadlines without reviving stopped runs or losing selections', () => fixture(async h => {
+  await h.start(); await h.start(TRIAL_TENANT);
+  await h.request('updateStatuses', TENANT, {emailStatuses: ['RETRY']});
+  await h.request('stop', TRIAL_TENANT);
+  const original = structuredClone(h.store.state.runs[TENANT]);
+  h.store.state.runs[TENANT].endsAt = h.time + LEGACY_DURATION;
+  h.alarms.set(endAlarm(TENANT), {when: h.time + LEGACY_DURATION});
+  h.time += LEGACY_DURATION + 1;
+  await h.reload();
+  const run = h.store.state.runs[TENANT];
+  assert.equal(run.running, true);
+  assert.equal(run.endsAt, null);
+  for (const key of ['startedAt', 'tabId', 'seen', 'sent', 'scope', 'emailStatuses']) assert.deepEqual(run[key], original[key]);
+  assert.equal(h.store.state.runs[TRIAL_TENANT].running, false);
+  assert.equal(h.alarms.has(endAlarm(TENANT)), false);
+  assert.equal(h.monitoring.at(-1).endsAt, null);
+}));
+test('Connect validates and saves the relay key without sending a notification', () => fixture(async h => {
+  assert.equal((await h.request('connect')).ok, true);
+  assert.equal(h.store.relayToken, 'a'.repeat(64));
+  assert.equal(h.delivered.length, 0);
+  assert.equal((await h.request('status')).value.relay.connected, true);
+}));
+test('a rejected relay key is not saved and its error is shown in relay health', () => fixture(async h => {
+  const result = await h.request('connect');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Invalid relay key/);
+  assert.equal(h.store.relayToken, undefined);
+  const status = (await h.request('status')).value;
+  assert.equal(status.relay.connected, false);
+  assert.match(status.relay.error, /Invalid relay key/);
+}, {relayFetch: async () => Response.json({error: 'Invalid relay key'}, {status: 401})}));

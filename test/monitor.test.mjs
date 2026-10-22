@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import {mkdtemp, rm, readFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {DURATION} from '../extension/core.js';
 import {createMonitoringWatch, validateMonitor, HEARTBEAT_TIMEOUT} from '../relay/monitor.mjs';
 import {createRelay} from '../relay/server.mjs';
 import {TENANT, TRIAL_TENANT} from './fixtures.mjs';
 import {backgroundHarness, message, token} from './background-harness.mjs';
+const LEGACY_DURATION = 9 * 3600000;
 
 async function fixture(action) {
   const folder = await mkdtemp(join(tmpdir(), 'is-monitor-'));
@@ -22,7 +22,7 @@ async function fixture(action) {
   const monitor = await createMonitoringWatch(options);
   const run = clock;
   const update = (tenant, action = 'heartbeat', startedAt = run) => ({action, tenant, run: startedAt,
-    endsAt: startedAt + DURATION, lastCheck: clock, status: 'healthy'});
+    endsAt: null, lastCheck: clock, status: 'healthy'});
   try {await action({monitor, update, sent, stateFile,
     advance(ms) {clock += ms;}, setBroken(value) {smtpBroken = value;}, restart: () => createMonitoringWatch(options)});}
   finally {await rm(folder, {recursive: true, force: true});}
@@ -45,7 +45,7 @@ test('missed heartbeat emails only the interrupted tenant, once per outage', () 
   assert.equal(f.sent.length, 2);
   assert.notEqual(f.sent[0].episode, f.sent[1].episode);
 }));
-test('manual Stop and scheduled expiry are silent, and stale Stop cannot cancel a new run', () => fixture(async f => {
+test('manual Stop is silent, stale Stop cannot cancel a new run, and runs have no expiry', () => fixture(async f => {
   const old = f.update(TENANT, 'start');
   await f.monitor.receive(old);
   f.advance(1);
@@ -53,14 +53,15 @@ test('manual Stop and scheduled expiry are silent, and stale Stop cannot cancel 
   await f.monitor.receive(next);
   await f.monitor.receive({...old, action: 'stop'});
   assert.equal(Object.keys(JSON.parse(await readFile(f.stateFile, 'utf8'))).length, 1);
-  f.advance(DURATION - 60000);
-  await f.monitor.receive({...next, action: 'heartbeat', lastCheck: next.endsAt - 60000});
+  f.advance(3 * 24 * 3600000);
+  await f.monitor.receive({...f.update(TENANT, 'heartbeat', next.run)});
   f.advance(60000);
   await f.monitor.check();
   assert.equal(f.sent.length, 0);
-  assert.equal(Object.keys(JSON.parse(await readFile(f.stateFile, 'utf8'))).length, 0);
-  await f.monitor.receive(f.update(TRIAL_TENANT, 'start', next.endsAt));
-  await f.monitor.receive({action: 'stop', tenant: TRIAL_TENANT, run: next.endsAt});
+  assert.equal(Object.keys(JSON.parse(await readFile(f.stateFile, 'utf8'))).length, 1);
+  await f.monitor.receive({...next, action: 'stop'});
+  await f.monitor.receive(f.update(TRIAL_TENANT, 'start', next.run));
+  await f.monitor.receive({action: 'stop', tenant: TRIAL_TENANT, run: next.run});
   f.advance(HEARTBEAT_TIMEOUT); await f.monitor.check();
   assert.equal(f.sent.length, 0);
 }));
@@ -88,19 +89,25 @@ test('relay shutdown warns active tenants and a hard-crash gap is detected after
   assert.equal(f.sent.length, 3);
   assert.match(f.sent[2].problem, /heartbeat/);
 }));
-test('a missed gap during a run is reported on restart even if its nine-hour window has ended', () => fixture(async f => {
+test('unlimited runs still report a missed heartbeat after days and a relay restart', () => fixture(async f => {
   await f.monitor.receive(f.update(TENANT, 'start'));
-  f.advance(DURATION + 1);
+  f.advance(3 * 24 * 3600000);
   const restarted = await f.restart(); await restarted.check();
   assert.equal(f.sent.length, 1);
-  assert.equal(Object.keys(JSON.parse(await readFile(f.stateFile, 'utf8'))).length, 0);
+  assert.equal(Object.keys(JSON.parse(await readFile(f.stateFile, 'utf8'))).length, 1);
+  await restarted.receive(f.update(TENANT));
+  f.advance(HEARTBEAT_TIMEOUT); await restarted.check();
+  assert.equal(f.sent.length, 2);
 }));
-test('monitor updates require canonical HTTPS tenants and a valid nine-hour window', () => {
+test('monitor updates require canonical HTTPS tenants and valid unlimited or legacy windows', () => {
   const run = 1791800000000;
-  const good = {action: 'start', tenant: TENANT, run, endsAt: run + DURATION, lastCheck: run, status: 'healthy'};
+  const good = {action: 'start', tenant: TENANT, run, endsAt: null, lastCheck: run, status: 'healthy'};
   assert.equal(validateMonitor(good), good);
+  assert.doesNotThrow(() => validateMonitor({...good, lastCheck: run + 30 * 86400000}));
+  assert.doesNotThrow(() => validateMonitor({...good, endsAt: run + LEGACY_DURATION}));
+  assert.throws(() => validateMonitor({...good, endsAt: run + LEGACY_DURATION, lastCheck: run + LEGACY_DURATION + 1}));
   for (const changed of [{tenant: 'http://example.com'}, {tenant: 'https://user:pass@example.com'}, {action: 'delete'},
-    {endsAt: run + 1}, {lastCheck: run - 1}, {lastCheck: run + DURATION + 1}, {status: 'made-up'},
+    {endsAt: run - 1}, {endsAt: undefined}, {endsAt: 'forever'}, {endsAt: -1}, {lastCheck: run - 1}, {lastCheck: Infinity}, {status: 'made-up'},
     {phase: {}}, {phase: 'x'.repeat(101)}, {problem: 42}, {problem: 'x'.repeat(401)}]) assert.throws(() => validateMonitor({...good, ...changed}));
   assert.doesNotThrow(() => validateMonitor({action: 'stop', tenant: TENANT, run}));
 });
@@ -138,7 +145,7 @@ test('HTTP heartbeats are acknowledged and persisted while SMTP delivery is bloc
     }, body: JSON.stringify(body), signal: AbortSignal.timeout(1500)});
     alertRequest = post('/alert', {kind: 'test', nonce: 'blocked-mail'});
     await sending;
-    const heartbeat = await post('/monitor', {action: 'start', tenant: TENANT, run: now, endsAt: now + DURATION,
+    const heartbeat = await post('/monitor', {action: 'start', tenant: TENANT, run: now, endsAt: null,
       lastCheck: now, status: 'healthy', phase: 'Handing message alerts to notification relay'});
     assert.equal(heartbeat.status, 200);
     const leases = JSON.parse(await readFile(join(folder, 'state.json.monitoring'), 'utf8'));
@@ -232,3 +239,30 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     await rm(folder, {recursive: true, force: true});
   }
 });
+
+test('a persisted legacy lease can upgrade to unlimited without losing pending outage notices', () => fixture(async f => {
+  const old = {...f.update(TENANT, 'start'), endsAt: f.update(TENANT).run + LEGACY_DURATION};
+  await f.monitor.receive(old);
+  f.advance(HEARTBEAT_TIMEOUT); f.setBroken(true);
+  await f.monitor.check();
+  const restarted = await f.restart();
+  await restarted.receive(f.update(TENANT));
+  f.advance(LEGACY_DURATION + 1);
+  await restarted.receive(f.update(TENANT));
+  f.setBroken(false); await restarted.check();
+  assert.equal(f.sent.length, 1);
+  const lease = Object.values(JSON.parse(await readFile(f.stateFile, 'utf8')))[0];
+  assert.equal(lease.endsAt, null);
+  await restarted.shutdown();
+  // The already-sent outage notice does not produce a duplicate at shutdown.
+  assert.equal(f.sent.length, 1);
+}));
+test('finite leases from older extensions still expire silently after a recent heartbeat', () => fixture(async f => {
+  const old = {...f.update(TENANT, 'start'), endsAt: f.update(TENANT).run + LEGACY_DURATION};
+  await f.monitor.receive(old);
+  f.advance(LEGACY_DURATION - 60000);
+  await f.monitor.receive({...old, action: 'heartbeat', lastCheck: old.endsAt - 60000});
+  f.advance(60000); await f.monitor.check();
+  assert.equal(f.sent.length, 0);
+  assert.deepEqual(JSON.parse(await readFile(f.stateFile, 'utf8')), {});
+}));

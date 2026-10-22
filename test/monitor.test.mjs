@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp, rm, readFile} from 'node:fs/promises';
+import {mkdtemp, rm, readFile, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createMonitoringWatch, validateMonitor, HEARTBEAT_TIMEOUT} from '../relay/monitor.mjs';
-import {createRelay} from '../relay/server.mjs';
+import {createRelay, composeEmail, validateAlert, alertKey} from '../relay/server.mjs';
+import {discordMessage} from '../relay/discord.mjs';
+import {teamsMessage} from '../relay/teams.mjs';
 import {TENANT, TRIAL_TENANT} from './fixtures.mjs';
 import {backgroundHarness, message, token} from './background-harness.mjs';
 const LEGACY_DURATION = 9 * 3600000;
@@ -13,17 +15,18 @@ async function fixture(action) {
   const folder = await mkdtemp(join(tmpdir(), 'is-monitor-'));
   let clock = 1791800000000;
   let smtpBroken = false;
-  const sent = [];
+  const sent = [], all = [];
   const stateFile = join(folder, 'monitor.json');
   const options = {stateFile, now: () => clock, sendAlert: async alert => {
     if (smtpBroken) throw new Error('SMTP unavailable');
-    sent.push(alert);
+    all.push(alert);
+    if (alert.kind === 'stopped') sent.push(alert);
   }};
   const monitor = await createMonitoringWatch(options);
   const run = clock;
   const update = (tenant, action = 'heartbeat', startedAt = run) => ({action, tenant, run: startedAt,
     endsAt: null, lastCheck: clock, status: 'healthy'});
-  try {await action({monitor, update, sent, stateFile,
+  try {await action({monitor, update, sent, all, stateFile,
     advance(ms) {clock += ms;}, setBroken(value) {smtpBroken = value;}, restart: () => createMonitoringWatch(options)});}
   finally {await rm(folder, {recursive: true, force: true});}
 }
@@ -39,8 +42,9 @@ test('missed heartbeat emails only the interrupted tenant, once per outage', () 
   assert.equal(f.sent[0].kind, 'stopped');
   assert.equal(f.sent[0].tenant, TENANT);
   await f.monitor.receive(f.update(TENANT));
-  f.advance(HEARTBEAT_TIMEOUT);
+  f.advance(HEARTBEAT_TIMEOUT - 2);
   await f.monitor.receive(f.update(TRIAL_TENANT));
+  f.advance(2);
   await f.monitor.check();
   assert.equal(f.sent.length, 2);
   assert.notEqual(f.sent[0].episode, f.sent[1].episode);
@@ -52,18 +56,20 @@ test('manual Stop is silent, stale Stop cannot cancel a new run, and runs have n
   const next = f.update(TENANT, 'start', old.run + 1);
   await f.monitor.receive(next);
   await f.monitor.receive({...old, action: 'stop'});
+  await f.monitor.check();
   assert.equal(Object.keys(JSON.parse(await readFile(f.stateFile, 'utf8'))).length, 1);
   f.advance(3 * 24 * 3600000);
   await f.monitor.receive({...f.update(TENANT, 'heartbeat', next.run)});
   f.advance(60000);
   await f.monitor.check();
-  assert.equal(f.sent.length, 0);
+  assert.equal(f.sent.length, 1); // The three-day heartbeat gap is detected on reconnect.
+  assert.ok(f.all.some(alert => alert.kind === 'resumed'));
   assert.equal(Object.keys(JSON.parse(await readFile(f.stateFile, 'utf8'))).length, 1);
   await f.monitor.receive({...next, action: 'stop'});
   await f.monitor.receive(f.update(TRIAL_TENANT, 'start', next.run));
   await f.monitor.receive({action: 'stop', tenant: TRIAL_TENANT, run: next.run});
   f.advance(HEARTBEAT_TIMEOUT); await f.monitor.check();
-  assert.equal(f.sent.length, 0);
+  assert.equal(f.sent.length, 1); // Manual stops add no interruption notice.
 }));
 test('SMTP failure and relay restart retain pending notices even if monitoring recovers', () => fixture(async f => {
   await f.monitor.receive(f.update(TENANT, 'start'));
@@ -83,7 +89,8 @@ test('relay shutdown warns active tenants and a hard-crash gap is detected after
   await f.monitor.shutdown(); await f.monitor.shutdown();
   assert.equal(f.sent.length, 2);
   assert.match(f.sent[0].problem, /relay is stopping/);
-  await f.monitor.receive(f.update(TENANT)); // Monitoring recovers after a restart.
+  f.advance(1);
+  await f.monitor.receive(f.update(TENANT)); // A fresh SAP check confirms recovery after restart.
   f.advance(HEARTBEAT_TIMEOUT);
   const restarted = await f.restart(); await restarted.check();
   assert.equal(f.sent.length, 3);
@@ -153,7 +160,7 @@ test('HTTP heartbeats are acknowledged and persisted while SMTP delivery is bloc
   } finally {
     release();
     if (alertRequest) await alertRequest;
-    if (server) await new Promise(resolve => server.close(resolve));
+    if (server) {await server.checkMonitoring(); await new Promise(resolve => server.close(resolve));}
     await rm(folder, {recursive: true, force: true});
   }
 });
@@ -179,6 +186,9 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     h.sapErrors.set(`${TENANT}:retry`, new Response('Error service down', {status: 500}));
     assert.equal((await h.start()).ok, true);
     assert.equal((await h.start(TRIAL_TENANT)).ok, true);
+    await server.checkMonitoring();
+    assert.equal(mails.filter(mail => /monitoring started/.test(mail.subject)).length, 2);
+    mails.length = 0;
     assert.equal(h.errorReads.length, 0); // Baselines do not fetch exception details.
     h.sap.set(TENANT, [
       baseline,
@@ -235,7 +245,7 @@ test('real extension scripts → authenticated HTTP relay → mail delivery and 
     assert.equal(mails.length, 11); // Expected Stop disarms shutdown notices too.
   } finally {
     if (h) h.close();
-    if (server) await new Promise(resolve => server.close(resolve));
+    if (server) {await server.checkMonitoring(); await new Promise(resolve => server.close(resolve));}
     await rm(folder, {recursive: true, force: true});
   }
 });
@@ -250,19 +260,137 @@ test('a persisted legacy lease can upgrade to unlimited without losing pending o
   f.advance(LEGACY_DURATION + 1);
   await restarted.receive(f.update(TENANT));
   f.setBroken(false); await restarted.check();
-  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent.length, 2); // Both distinct outages survive recovery before delivery.
   const lease = Object.values(JSON.parse(await readFile(f.stateFile, 'utf8')))[0];
   assert.equal(lease.endsAt, null);
   await restarted.shutdown();
-  // The already-sent outage notice does not produce a duplicate at shutdown.
-  assert.equal(f.sent.length, 1);
+  // Recovery rearms interruption reporting for a later relay shutdown.
+  assert.equal(f.sent.length, 3);
 }));
 test('finite leases from older extensions still expire silently after a recent heartbeat', () => fixture(async f => {
-  const old = {...f.update(TENANT, 'start'), endsAt: f.update(TENANT).run + LEGACY_DURATION};
+  const old = {...f.update(TENANT, 'start'), endsAt: f.update(TENANT).run + 120000};
   await f.monitor.receive(old);
-  f.advance(LEGACY_DURATION - 60000);
+  f.advance(60000);
   await f.monitor.receive({...old, action: 'heartbeat', lastCheck: old.endsAt - 60000});
   f.advance(60000); await f.monitor.check();
   assert.equal(f.sent.length, 0);
   assert.deepEqual(JSON.parse(await readFile(f.stateFile, 'utf8')), {});
 }));
+
+test('manual starts notify once per tenant and run, including a new start after Stop', () => fixture(async f => {
+  const first = f.update(TENANT, 'start');
+  await f.monitor.receive(first); await f.monitor.receive(first);
+  await f.monitor.receive(f.update(TRIAL_TENANT, 'start'));
+  await f.monitor.check();
+  assert.deepEqual(f.all.map(alert => [alert.kind, alert.tenant]), [['started', TENANT], ['started', TRIAL_TENANT]]);
+  assert.match(f.all[0].problem, /started by you/);
+  assert.match(f.all[0].problem, /Time: .* IST/);
+  const restarted = await f.restart();
+  await restarted.receive(first); await restarted.check();
+  assert.equal(f.all.length, 2);
+  await restarted.receive({...first, action: 'stop'});
+  f.advance(1);
+  await restarted.receive(f.update(TENANT, 'start', first.run + 1));
+  await restarted.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['started', 'started', 'started']);
+}));
+
+test('recovery needs a newer successful SAP check and emits once per interruption', () => fixture(async f => {
+  const first = f.update(TENANT, 'start');
+  await f.monitor.receive(first); await f.monitor.check();
+  await f.monitor.receive({...first, action: 'heartbeat', status: 'problem', problem: 'SAP session expired'});
+  f.advance(60000);
+  await f.monitor.receive({...first, action: 'heartbeat'}); // Worker alive, SAP has not checked again.
+  await f.monitor.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['started']);
+  await f.monitor.receive(f.update(TENANT)); await f.monitor.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['started', 'resumed']);
+  assert.match(f.all[1].problem, /SAP session expired/);
+  const restarted = await f.restart();
+  await restarted.receive(f.update(TENANT)); await restarted.check();
+  assert.equal(f.all.length, 2);
+  await restarted.receive({...f.update(TENANT), status: 'problem', problem: 'Relay connection interrupted'});
+  f.advance(60000);
+  await restarted.receive(f.update(TENANT)); await restarted.check();
+  assert.equal(f.all[2].kind, 'resumed');
+  assert.notEqual(f.all[1].episode, f.all[2].episode);
+  assert.match(f.all[2].problem, /Relay connection interrupted/);
+}));
+
+test('sleep gaps and relay restarts preserve ordered start, interruption and recovery alerts through delivery failures', () => fixture(async f => {
+  f.setBroken(true);
+  await f.monitor.receive(f.update(TENANT, 'start'));
+  await f.monitor.check();
+  f.advance(HEARTBEAT_TIMEOUT);
+  const restarted = await f.restart();
+  await restarted.receive(f.update(TENANT)); // No timer ran during sleep.
+  await restarted.check();
+  assert.equal(f.all.length, 0);
+  const again = await f.restart();
+  f.setBroken(false); await again.check(); await again.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['started', 'stopped', 'resumed']);
+  assert.equal(f.all[1].episode, f.all[2].episode);
+  assert.match(f.all[2].problem, /no extension heartbeat/);
+}));
+
+test('shutdown recovery waits for fresh SAP progress and registration of legacy runs sends no false start', () => fixture(async f => {
+  const initial = f.update(TENANT);
+  await f.monitor.receive(initial); await f.monitor.check();
+  assert.equal(f.all.length, 0);
+  await f.monitor.shutdown();
+  const restarted = await f.restart();
+  await restarted.receive(initial); await restarted.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['stopped']);
+  f.advance(60000);
+  await restarted.receive(f.update(TENANT)); await restarted.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['stopped', 'resumed']);
+  assert.match(f.all[1].problem, /relay is stopping/);
+}));
+
+test('old outage records migrate without duplicating sent notices or losing a pending recovery', () => fixture(async f => {
+  const initial = f.update(TENANT);
+  await writeFile(f.stateFile, JSON.stringify({[`${TENANT}:${initial.run}`]: {...initial, lastContact: initial.run,
+    notice: {episode: initial.run, sent: true, problem: 'Computer was offline'}}}));
+  const upgraded = await f.restart();
+  f.advance(60000);
+  await upgraded.receive(f.update(TENANT)); await upgraded.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['resumed']);
+  assert.equal(f.all[0].episode, initial.run);
+}));
+
+test('a stale heartbeat cannot reintroduce a resolved problem or regress SAP progress', () => fixture(async f => {
+  const old = {...f.update(TENANT), status: 'problem', problem: 'Old problem'};
+  await f.monitor.receive(old);
+  f.advance(60000);
+  const fresh = f.update(TENANT);
+  await f.monitor.receive(fresh); await f.monitor.check();
+  await f.monitor.receive(old); await f.monitor.check();
+  assert.deepEqual(f.all.map(alert => alert.kind), ['resumed']);
+  const [lease] = Object.values(JSON.parse(await readFile(f.stateFile, 'utf8')));
+  assert.equal(lease.lastCheck, fresh.lastCheck);
+  assert.equal(lease.status, 'healthy');
+}));
+
+
+test('start and recovery alerts validate and render clearly in email, Discord and Teams', () => {
+  for (const kind of ['started', 'resumed']) {
+    const alert = {kind, tenant: TENANT, run: 123, episode: 456,
+      problem: 'Monitoring event. Time: 22/10/2026, 22:00:00 IST. @everyone'};
+    assert.equal(validateAlert(alert), alert);
+    assert.notEqual(alertKey(alert), alertKey({...alert, episode: 457}));
+    const email = composeEmail(alert);
+    assert.match(email.subject, new RegExp(`monitoring ${kind}`));
+    assert.ok(email.text.includes(new URL(TENANT).hostname));
+    const discord = discordMessage(alert);
+    assert.match(discord.embeds[0].title, new RegExp(`monitoring ${kind}`));
+    assert.equal(discord.embeds[0].color, 0x15803d);
+    assert.equal(discord.embeds[0].url, `${TENANT}/shell/monitoring`);
+    assert.deepEqual(discord.allowed_mentions, {parse: []});
+    const teams = teamsMessage(alert).attachments[0].content;
+    assert.match(teams.body[0].text, new RegExp(`monitoring ${kind}`));
+    assert.equal(teams.body[0].color, 'Good');
+    assert.ok(JSON.stringify(teams).includes('22/10/2026'));
+    assert.equal(teams.actions[0].url, `${TENANT}/shell/monitoring`);
+    assert.throws(() => validateAlert({...alert, episode: 'invalid'}));
+  }
+});

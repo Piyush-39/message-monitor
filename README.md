@@ -105,6 +105,14 @@ To change iFlow or package filters, stop the run, apply the new filters with **G
 
 **Reset data** at the bottom of the popup stops all tenant runs and clears the extension’s saved tenants, filters, counters, duplicate tracking and relay key after confirmation. Reconnect the relay to start again. The local relay’s queued notifications and delivery history are retained. Keep the relay running during reset so monitoring cancellation can be confirmed.
 
+## Monitoring start and recovery alerts
+
+Starting a tenant sends a **Monitoring started** notification through your configured Discord, Teams or email destination. If monitoring is interrupted, a **Monitoring resumed** notification follows the next successful SAP check. It includes the tenant, IST time and the previous interruption reason.
+
+Recovery covers SAP check failures, missed heartbeats (including Chrome closing or computer sleep), and a relay restart. Reopening Chrome or receiving a heartbeat alone does not confirm recovery; a fresh SAP check must succeed. Routine heartbeats and extension reloads do not repeat start alerts. Starting a new run after pressing Stop sends a new start alert. Manual Stop remains silent.
+
+These notifications are saved and retried across relay restarts, and do not increase the popup’s SAP message counters. Update and restart the relay to enable them; the existing extension already supplies the required monitoring updates.
+
 ## Keep monitoring running
 
 Keep Chrome, the relay, and your internet connection running, with the laptop lid open. The extension requests that the computer stay awake, but sleep, browser shutdown, or an expired SAP session can interrupt monitoring.

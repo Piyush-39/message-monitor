@@ -52,8 +52,8 @@ export function teamsMessage(alert) {
       ]}];
     link = message.url;
   } else {
-    title = alert.kind === 'test' ? 'IS Watchdog · test notification' : alert.kind === 'stopped' ? 'IS Watchdog · monitoring stopped' : 'IS Watchdog · monitoring needs attention';
-    body = [textBlock(title, {size: 'Large', weight: 'Bolder', color: alert.kind === 'test' ? 'Good' : 'Attention'}),
+    title = alert.kind === 'test' ? 'IS Watchdog · test notification' : alert.kind === 'stopped' ? 'IS Watchdog · monitoring stopped' : alert.kind === 'started' ? 'IS Watchdog · monitoring started' : alert.kind === 'resumed' ? 'IS Watchdog · monitoring resumed' : 'IS Watchdog · monitoring needs attention';
+    body = [textBlock(title, {size: 'Large', weight: 'Bolder', color: ['test', 'started', 'resumed'].includes(alert.kind) ? 'Good' : 'Attention'}),
       textBlock(alert.kind === 'test' ? 'Teams delivery is working. SAP alerts will show their status, iFlow, error details and SAP link here.' : alert.problem)];
     if (alert.tenant) {
       body.push(textBlock(`Tenant: ${new URL(alert.tenant).hostname}`));

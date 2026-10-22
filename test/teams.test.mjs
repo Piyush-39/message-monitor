@@ -213,6 +213,11 @@ test('extension → authenticated relay → Teams outbox includes selected statu
     assert.equal(unauthorized.status, 401);
     h = await backgroundHarness({relayFetch: (url, options) => nativeFetch(`${base}${new URL(url).pathname}`, options)});
     await h.start();
+    await server.checkMonitoring();
+    await delivery.flush();
+    assert.match(card(sent[0].body).body[0].text, /monitoring started/);
+    h.time += 1000;
+    sent.length = 0;
     h.sap.set(TENANT, [message('failed'), {...message('retry'), Status: 'RETRY'}, {...message('completed'), Status: 'COMPLETED'}]);
     h.sapErrors.set(`${TENANT}:failed`, 'Receiver connection refused');
     await h.poll(); await h.poll();
@@ -236,7 +241,7 @@ test('extension → authenticated relay → Teams outbox includes selected statu
     assert.equal(delivery.status().pending, 0);
   } finally {
     delivery?.stop(); if (delivery) await delivery.flush();
-    if (server) await new Promise(resolve => server.close(resolve));
+    if (server) {await server.checkMonitoring(); await new Promise(resolve => server.close(resolve));}
     h?.close(); await rm(folder, {recursive: true, force: true});
   }
 });

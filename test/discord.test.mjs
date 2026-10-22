@@ -239,6 +239,11 @@ test('extension → authenticated relay → saved Discord outbox → one alerts 
     const base = `http://127.0.0.1:${server.address().port}`;
     h = await backgroundHarness({relayFetch: (url, options) => nativeFetch(`${base}${new URL(url).pathname}`, options)});
     await h.start();
+    await server.checkMonitoring();
+    await delivery.flush();
+    assert.match(sent[0].body.embeds[0].title, /monitoring started/);
+    h.time += 100;
+    sent.length = 0;
     h.sap.set(TENANT, [message('redirect'), message('unrelated'), {...message('discarded'), Status: 'DISCARDED'}]
       .map(item => ({...item, IntegrationFlowName: 'IF_Orders_Process'})));
     h.sapErrors.set(`${TENANT}:redirect`, 'HTTP operation failed with statusCode: 302');
@@ -264,9 +269,15 @@ test('extension → authenticated relay → saved Discord outbox → one alerts 
     assert.ok(sent[3].url.startsWith(webhook));
     assert.match(sent[3].body.embeds[0].title, /monitoring stopped/);
     assert.equal(delivery.status().pending, 0);
+    h.time += 60000;
+    await h.poll(); await server.checkMonitoring(); await delivery.flush();
+    assert.match(sent.at(-1).body.embeds[0].title, /monitoring resumed/);
+    assert.equal(sent.at(-1).body.embeds[0].color, 0x15803d);
+    assert.match(sent.at(-1).body.embeds[0].description, /new SAP check completed/);
+    assert.equal(h.store.state.runs[TENANT].sent, 3); // Lifecycle notices are separate from SAP alerts.
   } finally {
     delivery?.stop(); if (delivery) await delivery.flush();
-    if (server) await new Promise(resolve => server.close(resolve));
+    if (server) {await server.checkMonitoring(); await new Promise(resolve => server.close(resolve));}
     h?.close(); await rm(folder, {recursive: true, force: true});
   }
 });
@@ -313,7 +324,7 @@ test('a slow Discord request does not hold the HTTP relay lock or block health a
       sending = f.delivery.flush();
       await entered;
       const run = f.options.now();
-      assert.equal((await post('/monitor', {action: 'start', tenant: TENANT, run, endsAt: run + 9 * 3600000, lastCheck: run, status: 'healthy'})).status, 200);
+      assert.equal((await post('/monitor', {action: 'heartbeat', tenant: TENANT, run, endsAt: run + 9 * 3600000, lastCheck: run, status: 'healthy'})).status, 200);
       const health = await fetch(`${base}/health`, {headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000)});
       assert.equal((await health.json()).delivery.pending, 1);
       release(Response.json({id: 'slow-confirmed'})); await sending;
@@ -367,4 +378,18 @@ test('health exposes queues stranded under inactive providers without leaking pa
     await writeFile(`${stateFile}.teams`, '{broken');
     assert.match((await inactiveOutboxes(stateFile, 'discord'))[0].error, /Could not read/);
   } finally {await new Promise(resolve => server.close(resolve));}
+}));
+
+
+test('start and resume notices have distinct durable identities across runs, outages and retries', () => fixture(async f => {
+  const lifecycle = (kind, run, episode) => ({kind, tenant: TENANT, run, episode, problem: 'Monitoring lifecycle event'});
+  const events = [lifecycle('started', 1, 1), lifecycle('resumed', 1, 1), lifecycle('resumed', 1, 2), lifecycle('started', 2, 2)];
+  for (const event of events) {await f.delivery.enqueue(event); await f.delivery.enqueue(event);}
+  const restarted = await createDiscordDelivery(f.options);
+  assert.equal(restarted.status().pending, 4);
+  for (const event of events) {await restarted.flush(); f.advance(100);}
+  assert.equal(f.sent.length, 4);
+  const again = await createDiscordDelivery(f.options);
+  for (const event of events) assert.equal((await again.enqueue(event)).duplicate, true);
+  assert.equal(again.status().pending, 0);
 }));

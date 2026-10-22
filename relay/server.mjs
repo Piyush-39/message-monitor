@@ -17,7 +17,7 @@ export function validateAlert(value) {
     return value;
   }
   if (!isTenantOrigin(value.tenant) || !Number.isSafeInteger(value.run)) throw new Error('Invalid tenant or run');
-  if (value.kind === 'problem' || value.kind === 'stopped') {
+  if (['problem', 'stopped', 'started', 'resumed'].includes(value.kind)) {
     if (!Number.isSafeInteger(value.episode) || typeof value.problem !== 'string' || value.problem.length > 400) throw new Error('Invalid problem');
     return value;
   }
@@ -37,11 +37,15 @@ export function validateAlert(value) {
 }
 export function alertKey(alert) {
   // Per-message receipts are also stored, so regrouped retries do not re-email sent IDs.
-  const identity = alert.kind === 'test' ? alert.nonce : ['problem', 'stopped'].includes(alert.kind) ? [alert.run, alert.episode] : alert.messages.map(message => message.id).sort();
+  const identity = alert.kind === 'test' ? alert.nonce : ['problem', 'stopped', 'started', 'resumed'].includes(alert.kind) ? [alert.run, alert.episode] : alert.messages.map(message => message.id).sort();
   return createHash('sha256').update(JSON.stringify([alert.kind, alert.tenant, identity])).digest('hex');
 }
 export function composeEmail(alert) {
   if (alert.kind === 'test') return {subject: 'IS Watchdog: test email', text: 'Your IS Message Watchdog email relay is working.'};
+  if (['started', 'resumed'].includes(alert.kind)) return {
+    subject: `IS Watchdog: monitoring ${alert.kind} — ${new URL(alert.tenant).hostname}`,
+    text: `${alert.problem}\n\nTenant: ${new URL(alert.tenant).hostname}\n\n${alert.tenant}/shell/monitoring`
+  };
   if (alert.kind === 'stopped') return {
     subject: `IS Watchdog: monitoring stopped — ${new URL(alert.tenant).hostname}`,
     text: `Monitoring was interrupted for ${alert.tenant}.\n\n${alert.problem}\n\nOpen the extension to check this tenant's status. Other tenant runs are independent.\n\n${alert.tenant}/shell/monitoring`
@@ -159,7 +163,12 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     catch { return reply(400, {error: 'Invalid alert request'}); }
     // Heartbeat receipts must not wait behind SMTP/provider delivery or notice retries.
     const result = request.url === '/monitor' ? monitor.receive(alert) : serialize(() => deliver(alert));
-    try { return reply(200, await result); }
+    try {
+      const value = await result;
+      // Dispatch persisted lifecycle events promptly, outside the heartbeat request.
+      if (request.url === '/monitor') server.checkMonitoring().catch(error => console.error('Monitoring check failed:', error.code || 'MONITOR_ERROR'));
+      return reply(200, value);
+    }
     catch (error) {
       // Do not log SMTP credentials, message bodies, or provider responses.
       console.error('Notification delivery failed:', error.code || 'DELIVERY_ERROR');

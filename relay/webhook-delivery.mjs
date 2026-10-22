@@ -121,7 +121,7 @@ export async function createWebhookDelivery({webhook: destinationURL, stateFile,
       const payload = formatMessage(alert);
       const duplicate = await change(next => {
         if (next.receipts[key] || next.pending[key]) return true;
-        next.pending[key] = {key, payload, priority: ['problem', 'stopped'].includes(alert.kind), attempts: 0, acceptedAt: now()};
+        next.pending[key] = {key, payload, priority: ['problem', 'stopped', 'started', 'resumed'].includes(alert.kind), attempts: 0, acceptedAt: now()};
         return false;
       });
       schedule();

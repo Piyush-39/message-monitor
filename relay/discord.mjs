@@ -52,10 +52,10 @@ export function discordMessage(alert) {
       footer: {text: 'Open the title to view this message in SAP IS'}
     };
   } else {
-    const title = alert.kind === 'test' ? 'IS Watchdog · test notification' : alert.kind === 'stopped' ? 'IS Watchdog · monitoring stopped' : 'IS Watchdog · monitoring needs attention';
-    embed = {title, color: alert.kind === 'test' ? 0x15803d : 0xb91c1c,
+    const title = alert.kind === 'test' ? 'IS Watchdog · test notification' : alert.kind === 'stopped' ? 'IS Watchdog · monitoring stopped' : alert.kind === 'started' ? 'IS Watchdog · monitoring started' : alert.kind === 'resumed' ? 'IS Watchdog · monitoring resumed' : 'IS Watchdog · monitoring needs attention';
+    embed = {title, color: ['test', 'started', 'resumed'].includes(alert.kind) ? 0x15803d : 0xb91c1c,
       description: alert.kind === 'test' ? 'Discord delivery is working. SAP alerts will show their status, iFlow, error details and SAP link here.' : safeText(alert.problem),
-      ...(alert.tenant ? {fields: [{name: 'Tenant', value: safeText(new URL(alert.tenant).hostname)}]} : {})};
+      ...(alert.tenant ? {url: `${alert.tenant}/shell/monitoring`, fields: [{name: 'Tenant', value: safeText(new URL(alert.tenant).hostname)}]} : {})};
   }
   return {username: 'IS Watchdog', allowed_mentions: {parse: []}, flags: 0, ...(content ? {content} : {}), embeds: [embed]};
 }

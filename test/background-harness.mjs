@@ -116,6 +116,7 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
       return request('start', null, {sourceTabId: source.id});
     },
     async poll(name = POLL_ALARM) {onAlarm({name}); return request('status');},
+    fireAlarm(name) {onAlarm({name});},
     close() {Date.now = originalNow; globalThis.chrome = originalChrome; globalThis.fetch = originalFetch;}
   };
 }

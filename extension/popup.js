@@ -64,6 +64,8 @@ async function render(notice = '') {
     detail.textContent += `\nMonitoring: ${count ? `${count} iFlow${count === 1 ? '' : 's'}` : run.scope?.packageId ? 'All iFlows in the selected package' : 'All iFlows'}`;
     if (run.scope?.packageId) detail.textContent += `\nPackage: ${run.scope.packageId}`;
     if (run.lastCheck) detail.textContent += `\nLast check: ${new Date(run.lastCheck).toLocaleTimeString()}`;
+    if (run.running && run.phase) detail.textContent += `\nActivity: ${run.phase}`;
+    if (run.pendingAlerts) detail.textContent += `\nAlerts awaiting handoff: ${run.pendingAlerts}. Retrying on the next check.`;
     if (run.lastRefresh) detail.textContent += `\nLast table refresh: ${new Date(run.lastRefresh).toLocaleTimeString()}`;
     if (run.tableRefresh === false) detail.textContent += '\nTable refresh unavailable; alert checks continue.';
     if (run.problem) detail.textContent += `\n${run.problem}`;

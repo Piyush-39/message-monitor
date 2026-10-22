@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {TENANT, TRIAL_TENANT, OTHER_TENANTS} from './fixtures.mjs';
-import {DURATION, POLL_ALARM, END_ALARM, endAlarm, EMAIL_STATUSES} from '../extension/core.js';
+import {DURATION, POLL_ALARM, HEARTBEAT_ALARM, END_ALARM, endAlarm, EMAIL_STATUSES} from '../extension/core.js';
 import {backgroundHarness, message} from './background-harness.mjs';
 const legacyStart = Date.now();
 
@@ -266,6 +266,130 @@ test('individual alerts persist progress and retry only unsent messages after a 
       if (fail && alert.messages.some(message => message.id === 'unrelated')) return Response.json({error: 'Temporary SMTP failure'}, {status: 502});
       accepted.push(alert);
     }
+    return Response.json({ok: true});
+  }});
+});
+
+test('specific SAP failures survive Chrome MAIN-world execution and changed causes notify again', () => fixture(async h => {
+  await h.start();
+  for (const [status, expected] of [[401, /rejected the session \(HTTP 401\)/], [403, /denied monitoring access \(HTTP 403\)/], [503, /HTTP 503/]]) {
+    h.sap.set(TENANT, () => new Response('', {status}));
+    await h.poll(); await h.poll();
+    assert.match(h.store.state.runs[TENANT].problem, expected);
+    assert.match(h.delivered.at(-1).problem, expected);
+    assert.match(h.monitoring.at(-1).problem, expected);
+    assert.equal(h.monitoring.at(-1).status, 'problem');
+  }
+  assert.equal(h.delivered.filter(alert => alert.kind === 'problem').length, 3);
+  h.sap.set(TENANT, () => {throw new TypeError('Failed to fetch');});
+  await h.poll();
+  assert.match(h.delivered.at(-1).problem, /before an HTTP response/);
+  assert.match(h.delivered.at(-1).problem, /expiry is not confirmed/);
+  h.sap.set(TENANT, () => {throw new DOMException('Timed out', 'TimeoutError');});
+  await h.poll();
+  assert.match(h.delivered.at(-1).problem, /SAP request timed out/);
+  h.sap.set(TENANT, []);
+  await h.poll();
+  assert.equal(h.store.state.runs[TENANT].problem, null);
+}));
+
+test('watchdog tabs resist Memory Saver while active, restore on Stop, and report discarded or closed tabs clearly', () => fixture(async h => {
+  await h.start();
+  const run = h.store.state.runs[TENANT];
+  const tab = h.tabs.get(run.tabId);
+  assert.equal(tab.autoDiscardable, false);
+  assert.equal(h.alarms.get(HEARTBEAT_ALARM).periodInMinutes, 1);
+  await h.reload();
+  assert.equal(tab.autoDiscardable, false);
+  tab.discarded = true;
+  await h.poll();
+  assert.match(h.delivered.at(-1).problem, /unloaded.*save memory/);
+  tab.discarded = false;
+  h.tabs.delete(run.tabId);
+  await h.poll();
+  assert.match(h.delivered.at(-1).problem, /tab was closed/);
+  h.tabs.set(run.tabId, tab);
+  await h.request('stop', TENANT);
+  assert.equal(tab.autoDiscardable, true);
+  assert.equal(h.alarms.has(HEARTBEAT_ALARM), false);
+  assert.equal(h.store.state.runs[TENANT].status, 'Stopped by you');
+}));
+
+test('the independent heartbeat continues while message delivery blocks and the table refresh happens first', async () => {
+  let release, waiting;
+  const entered = new Promise(resolve => {waiting = resolve;});
+  const blocked = new Promise(resolve => {release = resolve;});
+  let checking;
+  await fixture(async h => {
+    try {
+      await h.start();
+      h.sap.set(TENANT, [message('slow-delivery')]);
+      checking = h.poll();
+      await entered;
+      assert.deepEqual(h.tableClicks, [TENANT]);
+      h.time += 180000;
+      h.fireAlarm(HEARTBEAT_ALARM);
+      for (let i = 0; i < 30 && !h.monitoring.some(item => item.phase === 'Handing message alerts to notification relay'); i++) await new Promise(resolve => setImmediate(resolve));
+      const beat = h.monitoring.at(-1);
+      assert.equal(beat.action, 'heartbeat');
+      assert.equal(beat.phase, 'Handing message alerts to notification relay');
+      assert.equal(beat.lastCheck, h.time - 180000);
+      assert.equal(beat.status, 'problem');
+      assert.match(beat.problem, /extension is responding/);
+    } finally {release(); await checking;}
+  }, {relayFetch: async (url, options) => {
+    if (JSON.parse(options.body || '{}').kind === 'messages') {waiting(); await blocked;}
+    return Response.json({ok: true});
+  }});
+});
+
+test('Stop waits for an in-flight independent heartbeat so it cannot rearm monitoring after cancellation', async () => {
+  let release, entered, block = true;
+  const started = new Promise(resolve => {entered = resolve;});
+  const waiting = new Promise(resolve => {release = resolve;});
+  const received = [];
+  let stopping;
+  await fixture(async h => {
+    try {
+      await h.start();
+      h.fireAlarm(HEARTBEAT_ALARM);
+      await started;
+      stopping = h.request('stop', TENANT);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(received.includes('stop'), false);
+      block = false; release();
+      await stopping;
+      assert.deepEqual(received, ['start', 'heartbeat', 'stop']);
+    } finally {release(); if (stopping) await stopping;}
+  }, {relayFetch: async (url, options) => {
+    const body = JSON.parse(options.body || '{}');
+    if (new URL(url).pathname === '/monitor') {
+      if (body.action === 'heartbeat' && block) {entered(); await waiting;}
+      received.push(body.action);
+    }
+    return Response.json({ok: true});
+  }});
+});
+
+test('slow handoffs yield to the next SAP check and retry every unsent ID without duplicates', async () => {
+  let h;
+  const accepted = [];
+  await fixture(async value => {
+    h = value;
+    await h.start();
+    h.sap.set(TENANT, Array.from({length: 5}, (_, i) => message(`slow-${i}`)));
+    await h.poll();
+    assert.equal(h.store.state.runs[TENANT].sent, 3);
+    assert.equal(h.store.state.runs[TENANT].pendingAlerts, 2);
+    const firstCheck = h.store.state.runs[TENANT].lastCheck;
+    await h.poll();
+    assert.ok(h.store.state.runs[TENANT].lastCheck > firstCheck);
+    assert.equal(h.store.state.runs[TENANT].sent, 5);
+    assert.equal(h.store.state.runs[TENANT].pendingAlerts, 0);
+    assert.deepEqual(accepted, ['slow-0', 'slow-1', 'slow-2', 'slow-3', 'slow-4']);
+  }, {relayFetch: async (url, options) => {
+    const alert = JSON.parse(options.body || '{}');
+    if (alert.kind === 'messages') {accepted.push(alert.messages[0].id); h.time += 16000;}
     return Response.json({ok: true});
   }});
 });

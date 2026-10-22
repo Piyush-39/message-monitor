@@ -19,76 +19,96 @@ export function refreshMessageTable(expectedOrigin) {
   return true;
 }
 
-export async function readNonCompletedMessages(since, expectedOrigin, scope = {}, emailStatuses) {
-  const origin = location.origin;
-  if (origin !== expectedOrigin) {
-    throw new Error('SAP tab has left the tenant. Sign in again.');
+export async function readNonCompletedMessages(since, expectedOrigin, scope = {}, emailStatuses, reportErrors = false) {
+  // Chrome can drop MAIN-world exceptions from executeScript results. Return a
+  // plain envelope across that boundary so the actual SAP failure survives.
+  async function read() {
+    const origin = location.origin;
+    if (origin !== expectedOrigin) {
+      throw new Error('SAP tab has left the tenant. Sign in again.');
+    }
+    const url = new URL('/odata/api/v1/MessageProcessingLogs', origin);
+    const artifactIds = scope.artifactIds ?? [];
+    if (!Array.isArray(artifactIds) || artifactIds.some(id => typeof id !== 'string' || !id) ||
+        (scope.packageId != null && typeof scope.packageId !== 'string')) throw new Error('Invalid artifact monitoring scope.');
+    // OData string literals escape apostrophes by doubling them, not by URL encoding.
+    const literal = value => `'${value.replace(/'/g, "''")}'`;
+    if (emailStatuses !== undefined && (!Array.isArray(emailStatuses) || !emailStatuses.length ||
+        emailStatuses.some(status => typeof status !== 'string' || !/^[A-Z][A-Z0-9_]{0,49}$/.test(status) || ['ALL', 'COMPLETED'].includes(status)))) throw new Error('Invalid email status selection.');
+    const statusFilter = emailStatuses === undefined ? "Status ne 'COMPLETED'" : `(${emailStatuses.map(status => `Status eq ${literal(status)}`).join(' or ')})`;
+    const timestamp = new Date(since).toISOString().slice(0, 19);
+    // Processing/retrying messages may not have an end time yet. Keep LogEnd too
+    // so a message started before the run but ending during it can still be found.
+    const filters = [`${statusFilter} and (LogStart ge datetime'${timestamp}' or LogEnd ge datetime'${timestamp}')`];
+    if (artifactIds.length) filters.push(`(${artifactIds.map(id => `IntegrationArtifact/Id eq ${literal(id)}`).join(' or ')})`);
+    if (scope.packageId) filters.push(`IntegrationArtifact/PackageId eq ${literal(scope.packageId)}`);
+    url.searchParams.set('$format', 'json');
+    url.searchParams.set('$orderby', 'LogStart desc');
+    url.searchParams.set('$top', '50');
+    url.searchParams.set('$filter', filters.join(' and '));
+    const messages = [];
+    const visited = new Set();
+    const deadline = Date.now() + 20000;
+    let next = url.href;
+    while (next) {
+      const page = new URL(next, origin);
+      // Some SAP responses link to /api/v1, outside the browser-session route.
+      if (page.origin !== origin || !/^\/(?:odata\/)?api\/v1\/MessageProcessingLogs$/.test(page.pathname)) {
+        throw new Error('Unexpected SAP pagination URL.');
+      }
+      page.pathname = '/odata/api/v1/MessageProcessingLogs';
+      if (visited.has(page.href) || visited.size >= 200 || Date.now() >= deadline) throw new Error('SAP pagination did not finish within the check budget.');
+      visited.add(page.href);
+      let response;
+      try {response = await fetch(page.href, {
+        credentials: 'same-origin', cache: 'no-store', redirect: 'manual',
+        headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(Math.max(1, Math.min(10000, deadline - Date.now())))
+      });} catch (error) {
+        if (error.name === 'TimeoutError' || error.name === 'AbortError') throw new Error('SAP request timed out before the check could finish. Checks retry every minute; check your connection or SAP availability.');
+        if (globalThis.navigator?.onLine === false) throw new Error('Chrome is offline. Reconnect this computer to resume SAP checks automatically.');
+        throw new Error('SAP request failed before an HTTP response arrived. Check network/VPN and tenant availability; session expiry is not confirmed. Checks retry every minute.');
+      }
+      if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) throw new Error('SAP redirected the monitoring request instead of returning messages. The session may have expired. Sign in again in the watchdog tab; checks retry every minute.');
+      if (response.status === 401) throw new Error('SAP rejected the session (HTTP 401). Sign in again in the watchdog tab; checks retry every minute.');
+      if (response.status === 403) throw new Error('SAP denied monitoring access (HTTP 403). Check your SAP monitoring permissions or sign in again. Checks retry every minute.');
+      if (!response.ok) throw new Error(`SAP monitoring returned HTTP ${response.status}. ${response.status === 429 ? 'SAP is limiting requests.' : 'The tenant could not complete the request.'} Checks retry every minute.`);
+      if (!(response.headers.get('content-type') || '').includes('json')) {
+        throw new Error('SAP returned a login page or other non-JSON response instead of messages. Sign in again in the watchdog tab if prompted; checks retry every minute.');
+      }
+      let body;
+      try {body = await response.json();}
+      catch {throw new Error('SAP returned invalid JSON instead of monitoring data. Checks retry every minute; check tenant availability.');}
+      if (!Array.isArray(body.d?.results)) throw new Error('Unexpected SAP monitoring response.');
+      for (const item of body.d.results) {
+        if (item.Status === 'COMPLETED') continue;
+        if (typeof item.Status !== 'string' || !/^[A-Z][A-Z0-9_]{0,49}$/.test(item.Status) || item.Status === 'ALL') throw new Error('SAP returned a message without a valid status.');
+        if (emailStatuses && !emailStatuses.includes(item.Status)) continue;
+        // Check every result too: a malformed/mis-scoped pagination response must not email other iFlows.
+        if (artifactIds.length && typeof item.IntegrationArtifact?.Id !== 'string') throw new Error('SAP returned a message without its artifact ID for filtered monitoring.');
+        if (scope.packageId && typeof item.IntegrationArtifact?.PackageId !== 'string') throw new Error('SAP returned a message without its package ID for filtered monitoring.');
+        if (artifactIds.length && !artifactIds.includes(item.IntegrationArtifact.Id)) continue;
+        if (scope.packageId && item.IntegrationArtifact.PackageId !== scope.packageId) continue;
+        if (typeof item.MessageGuid !== 'string' || !item.MessageGuid) throw new Error('Message has no message ID.');
+        const date = /\/Date\((\d+)(?:[+-]\d+)?\)\//.exec(item.LogEnd || item.LogStart || '');
+        messages.push({
+          id: item.MessageGuid,
+          status: item.Status,
+          flow: String(item.IntegrationFlowName || item.IntegrationArtifact?.Name || 'Unknown flow').slice(0, 300),
+          time: date ? new Date(Number(date[1])).toISOString() : '',
+          url: `${origin}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify({identifier: item.MessageGuid}))}`
+        });
+      }
+      next = body.d.__next || null;
+    }
+    return messages;
   }
-  const url = new URL('/odata/api/v1/MessageProcessingLogs', origin);
-  const artifactIds = scope.artifactIds ?? [];
-  if (!Array.isArray(artifactIds) || artifactIds.some(id => typeof id !== 'string' || !id) ||
-      (scope.packageId != null && typeof scope.packageId !== 'string')) throw new Error('Invalid artifact monitoring scope.');
-  // OData string literals escape apostrophes by doubling them, not by URL encoding.
-  const literal = value => `'${value.replace(/'/g, "''")}'`;
-  if (emailStatuses !== undefined && (!Array.isArray(emailStatuses) || !emailStatuses.length ||
-      emailStatuses.some(status => typeof status !== 'string' || !/^[A-Z][A-Z0-9_]{0,49}$/.test(status) || ['ALL', 'COMPLETED'].includes(status)))) throw new Error('Invalid email status selection.');
-  const statusFilter = emailStatuses === undefined ? "Status ne 'COMPLETED'" : `(${emailStatuses.map(status => `Status eq ${literal(status)}`).join(' or ')})`;
-  const timestamp = new Date(since).toISOString().slice(0, 19);
-  // Processing/retrying messages may not have an end time yet. Keep LogEnd too
-  // so a message started before the run but ending during it can still be found.
-  const filters = [`${statusFilter} and (LogStart ge datetime'${timestamp}' or LogEnd ge datetime'${timestamp}')`];
-  if (artifactIds.length) filters.push(`(${artifactIds.map(id => `IntegrationArtifact/Id eq ${literal(id)}`).join(' or ')})`);
-  if (scope.packageId) filters.push(`IntegrationArtifact/PackageId eq ${literal(scope.packageId)}`);
-  url.searchParams.set('$format', 'json');
-  url.searchParams.set('$orderby', 'LogStart desc');
-  url.searchParams.set('$top', '50');
-  url.searchParams.set('$filter', filters.join(' and '));
-  const messages = [];
-  const visited = new Set();
-  const deadline = Date.now() + 20000;
-  let next = url.href;
-  while (next) {
-    const page = new URL(next, origin);
-    // Some SAP responses link to /api/v1, outside the browser-session route.
-    if (page.origin !== origin || !/^\/(?:odata\/)?api\/v1\/MessageProcessingLogs$/.test(page.pathname)) {
-      throw new Error('Unexpected SAP pagination URL.');
-    }
-    page.pathname = '/odata/api/v1/MessageProcessingLogs';
-    if (visited.has(page.href) || visited.size >= 200 || Date.now() >= deadline) throw new Error('SAP pagination did not finish within the check budget.');
-    visited.add(page.href);
-    const response = await fetch(page.href, {
-      credentials: 'same-origin', cache: 'no-store', redirect: 'error',
-      headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(Math.max(1, Math.min(10000, deadline - Date.now())))
-    });
-    if (response.status === 401 || response.status === 403) throw new Error('SAP session expired or access denied. Sign in again.');
-    if (!response.ok) throw new Error(`SAP monitoring returned HTTP ${response.status}.`);
-    if (!(response.headers.get('content-type') || '').includes('json')) {
-      throw new Error('SAP returned a login page instead of messages. Sign in again.');
-    }
-    const body = await response.json();
-    if (!Array.isArray(body.d?.results)) throw new Error('Unexpected SAP monitoring response.');
-    for (const item of body.d.results) {
-      if (item.Status === 'COMPLETED') continue;
-      if (typeof item.Status !== 'string' || !/^[A-Z][A-Z0-9_]{0,49}$/.test(item.Status) || item.Status === 'ALL') throw new Error('SAP returned a message without a valid status.');
-      if (emailStatuses && !emailStatuses.includes(item.Status)) continue;
-      // Check every result too: a malformed/mis-scoped pagination response must not email other iFlows.
-      if (artifactIds.length && typeof item.IntegrationArtifact?.Id !== 'string') throw new Error('SAP returned a message without its artifact ID for filtered monitoring.');
-      if (scope.packageId && typeof item.IntegrationArtifact?.PackageId !== 'string') throw new Error('SAP returned a message without its package ID for filtered monitoring.');
-      if (artifactIds.length && !artifactIds.includes(item.IntegrationArtifact.Id)) continue;
-      if (scope.packageId && item.IntegrationArtifact.PackageId !== scope.packageId) continue;
-      if (typeof item.MessageGuid !== 'string' || !item.MessageGuid) throw new Error('Message has no message ID.');
-      const date = /\/Date\((\d+)(?:[+-]\d+)?\)\//.exec(item.LogEnd || item.LogStart || '');
-      messages.push({
-        id: item.MessageGuid,
-        status: item.Status,
-        flow: String(item.IntegrationFlowName || item.IntegrationArtifact?.Name || 'Unknown flow').slice(0, 300),
-        time: date ? new Date(Number(date[1])).toISOString() : '',
-        url: `${origin}/shell/monitoring/Messages/${encodeURIComponent(JSON.stringify({identifier: item.MessageGuid}))}`
-      });
-    }
-    next = body.d.__next || null;
+  try {
+    const messages = await read();
+    return reportErrors ? {ok: true, messages} : messages;
+  } catch (error) {
+    if (!reportErrors) throw error;
+    return {ok: false, error: String(error.message || error).slice(0, 400)};
   }
-  return messages;
 }
 
 // Serialized independently into the SAP tab; only enrich an unseen email batch.

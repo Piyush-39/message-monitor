@@ -34,6 +34,7 @@ export function emailStatuses(value = EMAIL_STATUSES) {
   return EMAIL_STATUSES.filter(status => value.includes(status));
 }
 export const POLL_ALARM = 'is-watchdog-poll';
+export const HEARTBEAT_ALARM = 'is-watchdog-heartbeat';
 export const END_ALARM = 'is-watchdog-end';
 export const endAlarm = tenant => `${END_ALARM}:${tenant}`;
 

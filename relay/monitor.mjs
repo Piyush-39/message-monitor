@@ -7,6 +7,8 @@ export function validateMonitor(value) {
       !['start', 'heartbeat', 'stop'].includes(value.action)) throw new Error('Invalid monitoring update');
   if (value.action !== 'stop' && (value.endsAt !== value.run + DURATION || !Number.isSafeInteger(value.lastCheck) ||
       value.lastCheck < value.run || value.lastCheck > value.endsAt || !['healthy', 'problem'].includes(value.status))) throw new Error('Invalid monitoring window');
+  if (value.problem != null && (typeof value.problem !== 'string' || value.problem.length > 400)) throw new Error('Invalid monitoring problem');
+  if (value.phase != null && (typeof value.phase !== 'string' || value.phase.length > 100)) throw new Error('Invalid monitoring phase');
   return value;
 }
 
@@ -14,9 +16,27 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
   let leases = {};
   try {leases = JSON.parse(await readFile(stateFile, 'utf8'));}
   catch (error) {if (error.code !== 'ENOENT') throw error;}
-  async function save() {
-    await writeFile(`${stateFile}.tmp`, JSON.stringify(leases), {mode: 0o600});
-    await rename(`${stateFile}.tmp`, stateFile);
+  let writes = Promise.resolve();
+  function save() {
+    const snapshot = JSON.stringify(leases);
+    const result = writes.then(async () => {
+      await writeFile(`${stateFile}.tmp`, snapshot, {mode: 0o600});
+      await rename(`${stateFile}.tmp`, stateFile);
+    });
+    writes = result.catch(() => {});
+    return result;
+  }
+  function missedHeartbeat(lease) {
+    if (lease.notice || Math.min(now(), lease.endsAt) - lease.lastContact < HEARTBEAT_TIMEOUT) return;
+    const time = value => new Date(value).toLocaleString('en-GB', {timeZone: 'Asia/Kolkata', hour12: false}) + ' IST';
+    lease.notice = {episode: lease.lastContact, sent: false, problem: [
+      `Reason: the relay received no extension heartbeat for ${Math.floor((Math.min(now(), lease.endsAt) - lease.lastContact) / 60000)} minutes.`,
+      `Last heartbeat: ${time(lease.lastContact)}. Last successful SAP check: ${time(lease.lastCheck)}.`,
+      `Last activity: ${lease.phase || 'not recorded by this extension version'}.`,
+      lease.problem ? `Last reported problem: ${lease.problem}` : `Last reported state: ${lease.status}.`,
+      'The exact cause is unknown: a missing heartbeat alone cannot distinguish Chrome/extension shutdown, computer sleep, or a blocked connection to the local relay.',
+      'Open the extension to check the tenant; keep Chrome and the relay running. SAP session expiry is not confirmed by this alert.'
+    ].join('\n')};
   }
   async function sendNotice(lease) {
     if (!lease.notice || lease.notice.sent) return;
@@ -34,6 +54,7 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
         leases[key] = {
           tenant: update.tenant, run: update.run, endsAt: update.endsAt,
           lastCheck: update.lastCheck, lastContact: now(), status: update.status,
+          problem: update.problem || null, phase: update.phase || null,
           // Preserve an undelivered outage notice when checks recover while Gmail is unavailable.
           ...(previous?.notice && !previous.notice.sent ? {notice: previous.notice} : {})
         };
@@ -43,9 +64,9 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
     },
     async check() {
       for (const [key, lease] of Object.entries(leases)) {
-        if (!lease.notice && Math.min(now(), lease.endsAt) - lease.lastContact >= HEARTBEAT_TIMEOUT) {
-          lease.notice = {episode: lease.lastContact, sent: false,
-            problem: 'No monitoring heartbeat arrived for at least three minutes. Chrome, the extension, or the computer may have stopped. Open Chrome and restart this tenant if needed.'};
+        const hadNotice = Boolean(lease.notice);
+        missedHeartbeat(lease);
+        if (!hadNotice && lease.notice) {
           await save();
         }
         try {await sendNotice(lease);}

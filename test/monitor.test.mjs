@@ -100,8 +100,55 @@ test('monitor updates require canonical HTTPS tenants and a valid nine-hour wind
   const good = {action: 'start', tenant: TENANT, run, endsAt: run + DURATION, lastCheck: run, status: 'healthy'};
   assert.equal(validateMonitor(good), good);
   for (const changed of [{tenant: 'http://example.com'}, {tenant: 'https://user:pass@example.com'}, {action: 'delete'},
-    {endsAt: run + 1}, {lastCheck: run - 1}, {lastCheck: run + DURATION + 1}, {status: 'made-up'}]) assert.throws(() => validateMonitor({...good, ...changed}));
+    {endsAt: run + 1}, {lastCheck: run - 1}, {lastCheck: run + DURATION + 1}, {status: 'made-up'},
+    {phase: {}}, {phase: 'x'.repeat(101)}, {problem: 42}, {problem: 'x'.repeat(401)}]) assert.throws(() => validateMonitor({...good, ...changed}));
   assert.doesNotThrow(() => validateMonitor({action: 'stop', tenant: TENANT, run}));
+});
+
+test('interruption notices preserve the last concrete problem, activity and IST timestamps across restart', () => fixture(async f => {
+  const problem = 'SAP denied monitoring access (HTTP 403). Check your SAP monitoring permissions.';
+  const update = {...f.update(TENANT, 'start'), status: 'problem', problem, phase: 'Reading SAP messages'};
+  await f.monitor.receive(update);
+  f.advance(HEARTBEAT_TIMEOUT);
+  const restarted = await f.restart();
+  await restarted.check();
+  const notice = f.sent[0].problem;
+  assert.match(notice, /no extension heartbeat for 3 minutes/);
+  assert.match(notice, /Last heartbeat: .* IST\. Last successful SAP check: .* IST/);
+  assert.match(notice, /Last activity: Reading SAP messages/);
+  assert.ok(notice.includes(problem));
+  assert.match(notice, /exact cause is unknown/);
+  assert.match(notice, /session expiry is not confirmed/);
+}));
+
+test('HTTP heartbeats are acknowledged and persisted while SMTP delivery is blocked', async () => {
+  const folder = await mkdtemp(join(tmpdir(), 'is-heartbeat-'));
+  let release, entered;
+  const sending = new Promise(resolve => {entered = resolve;});
+  const blocked = new Promise(resolve => {release = resolve;});
+  let server, alertRequest;
+  const now = Date.now();
+  try {
+    server = await createRelay({token, user: 'sender@gmail.com', recipient: 'recipient@gmail.com', stateFile: join(folder, 'state.json'), transport: {
+      async sendMail() {entered(); await blocked; return {accepted: ['recipient@gmail.com'], rejected: []};}
+    }});
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const post = (path, body) => fetch(`http://127.0.0.1:${server.address().port}${path}`, {method: 'POST', headers: {
+      Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'
+    }, body: JSON.stringify(body), signal: AbortSignal.timeout(1500)});
+    alertRequest = post('/alert', {kind: 'test', nonce: 'blocked-mail'});
+    await sending;
+    const heartbeat = await post('/monitor', {action: 'start', tenant: TENANT, run: now, endsAt: now + DURATION,
+      lastCheck: now, status: 'healthy', phase: 'Handing message alerts to notification relay'});
+    assert.equal(heartbeat.status, 200);
+    const leases = JSON.parse(await readFile(join(folder, 'state.json.monitoring'), 'utf8'));
+    assert.equal(leases[`${TENANT}:${now}`].lastCheck, now);
+  } finally {
+    release();
+    if (alertRequest) await alertRequest;
+    if (server) await new Promise(resolve => server.close(resolve));
+    await rm(folder, {recursive: true, force: true});
+  }
 });
 
 test('real extension scripts → authenticated HTTP relay → mail delivery and missing-poll alerts', async () => {

@@ -99,6 +99,22 @@ test('empty results are healthy but login HTML, access errors and malformed data
     new Response('', {status: 500}), json({d: {}}), json({d: {results: [item('')]}})
   ]) await assert.rejects(withSAP(async () => response, () => readNonCompletedMessages(Date.now(), TENANT)));
 });
+
+test('script envelopes identify authentication redirects without following them or exposing response bodies', async () => {
+  for (const response of [new Response(null, {status: 302}), {type: 'opaqueredirect', status: 0}]) {
+    const result = await withSAP(async (url, options) => {
+      assert.equal(options.redirect, 'manual');
+      return response;
+    }, () => readNonCompletedMessages(Date.now(), TENANT, {}, undefined, true));
+    assert.equal(result.ok, false);
+    assert.match(result.error, /SAP redirected the monitoring request/);
+  }
+  const malformed = await withSAP(async () => new Response('private-response', {headers: {'content-type': 'application/json'}}),
+    () => readNonCompletedMessages(Date.now(), TENANT, {}, undefined, true));
+  assert.equal(malformed.ok, false);
+  assert.match(malformed.error, /invalid JSON/);
+  assert.doesNotMatch(malformed.error, /private-response/);
+});
 test('selected statuses constrain SAP queries and every response page together with artifact filters', async () => {
   const selected = (id, status = 'FAILED', artifact = 'flow-a') => ({...item(id, status), IntegrationArtifact: {Id: artifact}});
   let pages = 0;

@@ -71,6 +71,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
   receipts = Object.fromEntries(Object.entries(receipts).filter(([, time]) => time > cutoff));
   let queue = Promise.resolve();
+  let monitorQueue = Promise.resolve();
   function serialize(operation) {
     const result = queue.then(operation);
     queue = result.catch(() => {});
@@ -105,7 +106,12 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     await rename(`${stateFile}.tmp`, stateFile);
     return {ok: true, ...(discordDelivery ? {queued: true, provider: 'discord'} : {})};
   }
-  const monitor = await createMonitoringWatch({stateFile: monitorFile, sendAlert: deliver, now});
+  const monitor = await createMonitoringWatch({stateFile: monitorFile, sendAlert: alert => serialize(() => deliver(alert)), now});
+  function monitorOperation(operation) {
+    const result = monitorQueue.then(operation);
+    monitorQueue = result.catch(() => {});
+    return result;
+  }
   const server = http.createServer(async (request, response) => {
     const reply = (code, body) => {
       response.writeHead(code, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'});
@@ -130,7 +136,8 @@ export async function createRelay({token, user, recipient, transport, stateFile 
       alert = (request.url === '/monitor' ? validateMonitor : validateAlert)(body);
     }
     catch { return reply(400, {error: 'Invalid alert request'}); }
-    const result = serialize(() => request.url === '/monitor' ? monitor.receive(alert) : deliver(alert));
+    // Heartbeat receipts must not wait behind SMTP/provider delivery or notice retries.
+    const result = request.url === '/monitor' ? monitor.receive(alert) : serialize(() => deliver(alert));
     try { return reply(200, await result); }
     catch (error) {
       // Do not log SMTP credentials, message bodies, or provider responses.
@@ -140,8 +147,8 @@ export async function createRelay({token, user, recipient, transport, stateFile 
   });
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
-  server.checkMonitoring = () => serialize(() => monitor.check());
-  server.notifyShutdown = () => serialize(() => monitor.shutdown());
+  server.checkMonitoring = () => monitorOperation(() => monitor.check());
+  server.notifyShutdown = () => monitorOperation(() => monitor.shutdown());
   let timer;
   server.once('listening', () => {
     discordDelivery?.start();

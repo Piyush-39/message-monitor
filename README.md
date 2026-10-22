@@ -1,205 +1,105 @@
 # IS Message Watchdog
 
-A small Chrome extension for SAP Integration Suite tenants in any region, including trial tenants and custom domains. The tenant is detected from the active Monitor Message Processing tab; there is no tenant allowlist to edit. It checks for new messages in your selected statuses every minute (all statuses except `COMPLETED` are selected by default) for nine hours using the existing browser session and sends alerts through a local relay using Discord or Gmail SMTP. No SAP client ID, client secret, copied cookie, or bearer token is required.
+A Chrome extension that checks SAP Integration Suite messages every minute for nine hours and sends alerts through a local relay to Discord or Gmail. It uses your signed-in browser session; no SAP API credentials are needed.
 
-Compatible tenants must expose the HTTPS `/shell/monitoring/Messages` page and browser-session `/odata/api/v1/MessageProcessingLogs` route used by this extension. A different monitoring UI/API requires a reader change; recognizing a domain alone does not guarantee compatibility. Multiple tenants can run together in the same Chrome profile. Each tenant has its own signed-in session, dedicated watchdog tab, nine-hour end time, accepted-message counter and duplicate tracking. Only one run per tenant origin can be active at a time.
+Monitor multiple tenants at once, filter by iFlow or package, and choose which statuses trigger alerts. Completed messages are always excluded.
 
-The extension uses Chrome's [optional host permissions](https://developer.chrome.com/docs/extensions/reference/api/permissions) to request each detected tenant separately.
+## Requirements
 
-## Set up Discord delivery (one channel)
+- Node.js 20.12 or later and Chrome 120 or later.
+- Access to your tenant’s **Monitor Message Processing** page in Chrome.
+- A Discord channel webhook or a Gmail account with an app password.
 
-Discord mode does not contact Gmail or require SMTP credentials. Every alert is sent to the one channel you configure. The extension and relay do not inspect error text to archive, route or silence alerts.
+## Set up notifications
 
-1. In Discord, create a private server for your alerts and one ordinary **text channel**, such as `sap-alerts`.
-2. Open that channel's **Edit Channel → Integrations → Webhooks → New Webhook**, select the channel and choose **Copy Webhook URL**. [Discord's webhook guide](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks).
-3. From this project directory, run:
-
-   ```sh
-   npm install
-   npm run setup:discord
-   ```
-
-   Paste the single URL when prompted; input is hidden. Setup checks the webhook using a GET request without posting a message, then saves it in the private, git-ignored `.env`. Existing Gmail settings and the relay key are preserved. Setup also removes obsolete archive-channel settings. Run `npm run setup` if you need to see the relay key for the extension.
-4. Restart the relay in your own Terminal: stop the existing `npm start` with Ctrl+C, then run `npm start` again. The startup line must say **Discord relay ready**. Keep it running during monitoring.
-5. Reload **IS Message Watchdog** in `chrome://extensions` (version **1.7.0**), open its popup and click **Send test notification**. Confirm the test arrives in your channel. Existing tenant runs, saved statuses, artifact selections, end times and seen IDs are preserved.
-6. Enable OS notifications and Discord mobile notifications for your channel. Mobile push alerts can also depend on your Discord desktop activity and device settings. [Discord mobile notification guide](https://support.discord.com/hc/en-us/articles/218892547--Mobile-Notifications-Settings-101).
-
-### Choosing where to manage archive rules
-
-Discord's built-in notification settings apply to channels; they do not provide Gmail-style user-created rules that automatically label or archive individual incoming alerts according to their error text. Telegram's archive applies to chats. A custom bot or separate rule-management application would be needed to add that workflow to either service.
-
-For reviewing an alert and then creating or editing rules for future matching alerts, an email inbox such as Gmail or Outlook is a better fit. Keep one SAP message per email so a rule cannot hide unrelated messages in a combined alert. Gmail's sender quota is a separate delivery issue: using a different SMTP sender with suitable capacity would let you keep your existing Gmail inbox and filters. Changing only the receiving app does not increase the current Gmail SMTP sender's quota.
-
-### Discord message format and configuration
-
-Each SAP message becomes its own card with a prominent status, full iFlow name, tenant, message ID, time, error excerpt and a clickable title linking to that SAP message. Mentions are disabled so error text cannot trigger `@everyone`, user or role pings. All cards are ordinary notifications, regardless of HTTP error code. Notification display is controlled by your Discord and device settings.
-
-Message times in Discord cards use **IST (Asia/Kolkata)**, for example `20 Oct 2026, 21:17:12 IST`. Each message also includes a plain-text `[STATUS] iFlow_name` summary for notification previews. This preserves the original underscores without adding the Markdown escape backslashes that iPhone previews can expose from an embed. Long names can still be shortened by the phone's notification layout; open the card for the full name and details.
-
-Restart the relay (Ctrl+C, then `npm start`) to apply this formatting to newly queued alerts; no extension reload is needed. Already queued or delivered cards retain their saved format.
-
-You can also configure manually using `.env.example`:
-
-```dotenv
-NOTIFICATION_PROVIDER=discord
-DISCORD_WEBHOOK_URL=<webhook URL for your alerts channel>
-RELAY_TOKEN=<keep your existing relay key>
-```
-
-Keep the webhook URL in `.env`, not in the extension. Set `NOTIFICATION_PROVIDER=email` and restart to return to Gmail. Only one provider is enabled at a time; Discord mode does not fall back to Gmail.
-
-### Discord queue, retries and delivery status
-
-The relay saves accepted notifications in `.relay-state.json.discord` **before** acknowledging them to Chrome. It delivers them in the background, following Discord's rate-limit headers and retry delays. A slow or unavailable Discord service does not hold SAP polling or heartbeats. Queued alerts survive relay restarts and continue retrying after the tenant's nine-hour run ends, provided the relay is running.
-
-The popup shows the queue count, confirmed deliveries in the last 30 days, and delivery errors. **Messages accepted by relay** on a tenant card counts successful handoffs (including queued Discord notifications); it does not claim that queued notifications have reached the phone.
-
-Network/5xx failures retry with backoff. A deleted or unauthorized webhook (HTTP 401/403/404) pauses delivery to avoid repeatedly calling an invalid endpoint. Recreate the webhook, rerun `npm run setup:discord` and restart; pending alerts are retained and use the replacement destination. A malformed card (HTTP 400) stays in the outbox and is counted as needing repair; other cards continue. Preserve that file when troubleshooting. Disk errors pause delivery and appear in the popup; fix disk access, then restart.
-
-Confirmed deliveries are deduplicated for 30 days. An ambiguous network failure after Discord accepts a request can still cause a duplicate on retry; Discord incoming webhooks do not provide an exactly-once guarantee. The outbox contains notification text, is created with private file permissions and is git-ignored. Do not delete it to clear an error, since doing so loses queued alerts and delivery tracking.
-
-## Set up email locally (alternative)
-
-Use Node.js 20.12 or later. From this folder:
+From the project directory, install dependencies:
 
 ```sh
 npm install
-npm run setup
-npm start
 ```
 
-Your local `.env` already contains the email settings. `npm run setup` reads it and prints only the relay key for the extension, without asking for credentials or changing the email settings. It reuses the saved key; if one is missing, it generates and saves one. For a new installation, copy `.env.example` to `.env` and fill in the email settings there first. `npm start` automatically loads `.env`; keep it running in your own Terminal for the monitoring shift, since a process started by an agent can be cancelled when its tool server restarts. The relay verifies Gmail authentication before it starts.
+Choose one delivery option below.
 
-Email mode uses `SMTP_USER` as sender and `ALERT_TO` as recipient (defaulting to the sender). The local `.env` is not included in the ZIP.
+### Discord
 
-Create an app password at https://myaccount.google.com/apppasswords if you do not already have one. Google requires 2-Step Verification and may restrict app passwords on some accounts: [Google instructions](https://support.google.com/accounts/answer/185833). Use an app password, not your normal Gmail password.
+1. In your Discord text channel, open **Edit Channel → Integrations → Webhooks → New Webhook** and copy the webhook URL.
+2. Run the setup command and paste the URL when prompted. It saves the settings in `.env` with hidden input.
+
+   ```sh
+   npm run setup:discord
+   ```
+
+3. Print the relay key, then start the relay:
+
+   ```sh
+   npm run setup
+   npm start
+   ```
+
+All alerts go to the configured channel. Enable channel and device notifications if you want mobile alerts.
+
+### Gmail
+
+1. For a new installation, copy `.env.example` to `.env`. Keep your existing `.env` if already configured.
+2. Set these values in `.env`:
+
+   - `NOTIFICATION_PROVIDER=email`
+   - `SMTP_USER`: your Gmail address.
+   - `SMTP_PASS`: your [Google app password](https://support.google.com/accounts/answer/185833), which requires 2-Step Verification.
+   - `ALERT_TO`: the address that should receive alerts.
+3. Generate or display the relay key, then start the relay:
+
+   ```sh
+   npm run setup
+   npm start
+   ```
+
+Keep the relay running in your Terminal during monitoring. Restart it after changing notification settings. Keep `.env` private; paste only the **relay key** into the extension.
 
 ## Load the extension
 
-1. In the **same Chrome Work profile where you log in to IS**, open `chrome://extensions`.
-2. Enable Developer mode, choose **Load unpacked**, and select this folder's `extension` directory.
-3. Open the extension popup and paste the **relay key**, not the Gmail app password.
-4. Click **Send test notification** and confirm that it arrives at your configured destination.
-5. Open any tenant's IS **Monitor Message Processing** page. Select the desired **Artifacts** and package, then click **Go** to apply the filters. Choose the **Notify for these statuses** checkboxes in the extension popup, then click **Start this tenant**. Allow access to that tenant when Chrome asks. Chrome remembers approved tenants; approval is required the first time you use a new tenant.
-6. Repeat step 5 from each additional tenant's monitor page. Existing runs keep monitoring. Each tenant appears as a separate card in the popup.
-7. Click **Open watchdog tab** or **Stop** on the card for the tenant you want to manage.
+1. In the Chrome profile where you sign in to SAP IS, open `chrome://extensions`.
+2. Enable **Developer mode**, click **Load unpacked**, and select this project’s `extension` directory.
+3. Open the extension popup and paste the relay key printed by `npm run setup`.
+4. Click **Send test notification** and confirm it arrives.
 
-Open each tenant in the same signed-in Chrome profile. Starting a second tenant does not stop the first. Stopping or finishing one run does not change another tenant's alarms or keep-awake request. Each tenant needs its own active login; different Chrome profiles require separate extension runs.
+## Start monitoring
 
-The extension creates a dedicated background monitor tab. It reads the same `/odata/api/v1/MessageProcessingLogs` request observed on your tenant, restricted to the run’s selected statuses. Leave that tab open. Do not start from an iFlow editor or a different Chrome profile.
+1. Open your tenant’s **Monitor Message Processing** page.
+2. Select the desired **Artifacts** and package, then click **Go** to apply the filters. Choose **All** to monitor all iFlows.
+3. Open the extension popup, choose the notification statuses, and click **Start this tenant**. Allow access to the tenant when Chrome asks.
+4. Leave the dedicated watchdog tab open. Repeat these steps for additional tenants in the same Chrome profile.
 
-Each run captures the applied page's selected technical iFlow IDs (`artifactIds`) and package (`packageId`) when you click Start. The baseline, subsequent SAP queries and alert results use that selection. Multiple selected iFlows are matched by ID; a package selection also restricts results to that package. **All** starts unrestricted monitoring. The popup shows the saved selection's iFlow count instead of listing every name or technical ID. Without explicit artifact IDs, it shows **All iFlows** or **All iFlows in the selected package**. The dedicated tab preserves these filters and shows All statuses with a rolling Past Hour window; alert checks independently use the statuses saved in the extension and always exclude Completed. To change a run's selection, Stop it, apply the new filters with Go, and Start again from that page. Changing the original tab's filters does not change an existing run.
+All seven non-Completed statuses are selected by default. Existing matching messages form the starting baseline and do not trigger alerts. New matching messages each get one notification with status, iFlow, tenant, time, message ID, error details when available, and a link to SAP IS. Previously recorded message IDs are suppressed, even if their status changes.
 
-Alert detection makes a fresh SAP request every minute and does not depend on the displayed table or manually clicking Refresh. The extension also invokes **Reload content** through the button's SAP UI5 press handler in the dedicated tab's Messages toolbar after each successful SAP read, before handing off notifications, keeping that table current. A plain DOM click does not trigger this handler on the observed monitor; the extension uses the registered `sap.m.Button.firePress()` event ([SAP UI5 API](https://ui5.github.io/typescript/api/sapui5/1.148/sap.m/sap/m/Button/classes/Button.html)). Other open monitor tabs are not refreshed. The popup shows the last table-refresh time; if SAP changes its toolbar or the button is unavailable, alert checks continue and the popup reports that table refresh is unavailable.
+Use the popup to check each tenant’s last successful check, accepted-message count, and end time:
 
-Existing messages matching the selected statuses are recorded as a baseline and do not trigger alerts. Each new message matching the selected statuses gets its own notification, including actual status, flow name, message ID, time, error text and a link to IS. In email mode, the subject includes the tenant and SAP message ID, keeping unrelated messages in separate Gmail conversations. Gmail error-text filters can therefore archive one email without hiding other alerts. Discord mode sends every card to the configured alerts channel without error-based filtering. Error text is fetched from the message’s `ErrorInformation/$value` endpoint using the same tenant session. Message payload and attachment endpoints are not read. Successfully accepted message IDs are deduplicated across checks; the local relay also persists delivery receipts for 30 days. Failed handoffs to the relay retry on subsequent checks. Discord notifications already accepted by the outbox retry independently in the background.
+- **Open watchdog tab** opens that tenant’s monitoring tab.
+- **Save statuses** updates an active tenant on its next check. Open that tenant’s monitor or watchdog tab before changing the checkboxes in the popup.
+- **Stop** ends that tenant’s run. Runs also end automatically after nine hours.
 
-The popup shows each tenant's status, last successful SAP check, table-refresh time, accepted-message count and end time. Email subjects identify the tenant. **Stop** ends the selected tenant's run; the run also stops automatically after nine hours. The dedicated tab stays open. Starting another run creates a fresh tab; old watchdog tabs can be closed after stopping. A check has a 20-second / 200-page budget; unusually high message volume is reported as a monitoring problem rather than silently truncated.
+To change iFlow or package filters, stop the run, apply the new filters with **Go**, and start again. Changing filters in the original page does not update an active run.
 
-## Upgrade to version 1.7.0: clear interruption reasons and session continuity
+## Keep monitoring running
 
-Restart the relay in your Terminal (Ctrl+C, then `npm start`), then reload **IS Message Watchdog** in `chrome://extensions`. The version should show **1.7.0**. Existing runs retain their filters, end times, saved statuses and duplicate tracking. No additional extension permissions are requested. A normal relay shutdown can send an interruption notice for active tenants.
+Keep Chrome, the relay, and your internet connection running, with the laptop lid open. The extension requests that the computer stay awake, but sleep, browser shutdown, or an expired SAP session can interrupt monitoring.
 
-The source and ZIP contain the update. Editing files does not update an already running relay or extension worker. Browser inspection during this change stayed on the existing Message Monitoring page; extension management, SAP settings and sign-in pages were not opened.
+The relay sends an interruption alert after roughly three minutes without an extension heartbeat, provided it can reach the notification service. Manual **Stop** and normal run expiry do not trigger this alert. Immediate alerts are unavailable while the whole computer is offline.
 
-## Session and laptop behavior
+Discord alerts are queued on disk and retried after delivery failures. The popup’s **Messages accepted by relay** count includes queued alerts; check the delivery status for confirmation. Preserve `.relay-state.json*` files when troubleshooting to avoid losing queued alerts and duplicate tracking.
 
-Each check sends an actual authenticated SAP read request. These requests provide activity that may prevent an inactivity timeout; they cannot guarantee renewal of every tenant or identity-provider session. A read-only check on the currently open production Message Monitoring page returned HTTP 200 on 22 October 2026. No other SAP page was opened. A full nine-hour shift and operation beyond the tenant's actual timeout still need live validation.
+## Troubleshooting and updates
 
-Version 1.7.0 keeps the dedicated watchdog tab from being automatically unloaded under memory pressure using Chrome's [`autoDiscardable: false`](https://developer.chrome.com/docs/extensions/reference/api/tabs). The original setting is restored when the run ends. Existing active tabs get this protection when the extension reloads. A manually unloaded/closed tab, a frozen tab, browser shutdown or computer sleep can still interrupt reads. SAP table refresh now happens before notification delivery, and slow notification handoffs yield after a 45-second work budget (an in-flight bounded request can finish afterward). Unsent IDs remain eligible on the next check, so a busy notification queue does not indefinitely delay the next authenticated SAP read.
+- **Relay unavailable or invalid key:** run `npm start`, check the Terminal for errors, and paste the key from `npm run setup` into the popup. The relay listens at `127.0.0.1:43171`.
+- **SAP sign-in or access error:** open the watchdog tab, sign in again if needed, and return to **Monitor Message Processing**. Checks retry every minute.
+- **Watchdog tab closed:** stop the affected run and start it again from the tenant’s monitor page.
+- **Discord delivery paused:** check the popup’s delivery error. For an invalid or deleted webhook, rerun `npm run setup:discord` and restart the relay.
+- **After updating the project:** restart the relay and click **Reload** for the extension in `chrome://extensions`.
 
-SAP redirects, HTTP 401 authentication rejection, HTTP 403 denied access, HTTP errors, network failure and request timeout now have separate messages with recovery steps. A redirect is detected without following it; the extension does not navigate to another SAP page or an identity-provider page. A network failure alone is not labelled session expiry. Checks continue retrying after you sign in and return the dedicated tab to Message Monitoring.
+## Development
 
-For unattended monitoring that does not depend on a human browser session, SAP documents [OAuth client-credentials authentication for API clients](https://help.sap.com/docs/integration-suite/sap-integration-suite/setting-up-inbound-http-connections-for-api-clients). Reading [Message Processing Logs](https://help.sap.com/docs/integration-suite/isuite-integrations-and-apis/message-processing-logs) requires the `MonitoringDataRead` role. This would need an administrator-provisioned API client and a separate relay polling implementation; it is a future option, not configured in this extension. SAP's [Cloud Integration idle-session KBA](https://userapps.support.sap.com/sap/support/knowledge/en/3394608) requires SAP for Me access for its full guidance. No tenant timeout setting was changed.
-
-If the session expires, access is denied, or a check fails, the badge turns red and a local notification appears. The relay sends one monitoring-problem notification per distinct cause during a tenant outage through the selected provider; Discord notices use the same persistent outbox. An issue in one tenant does not stop another tenant from checking or submitting notifications. Sign in again in the dedicated tab; checks retry every minute and scan from the start of the run with a five-minute overlap to catch missed/late logs. There is no password/MFA automation or automatic SSO workaround.
-
-Chrome requests permission to keep the computer awake during a run (display may sleep), and releases that request after all tenant runs have stopped or ended. Keep Chrome and the relay running and the laptop lid open. Closing the lid, quitting Chrome, a network outage or an OS sleep override can interrupt monitoring. Chrome alarms are best-effort, not a precise real-time schedule.
-
-If the relay is unavailable, the extension cannot hand off notifications; the popup and local notification show the error. In email mode, if the local relay process has an ambiguous SMTP failure after acceptance, a retry can occasionally duplicate an email; SMTP does not support guaranteed exactly-once delivery. Messages observed as Failed, Retry, Processing, Escalated, Cancelled, Discarded or Abandoned are eligible; Completed messages are excluded. Each message ID is accepted once, even if its status later changes. Messages that become Completed between checks may not be observed. Checks use both start and end times so messages without an end time can be detected.
-
-## Alerts when monitoring is interrupted
-
-The extension registers each run with the local relay and sends a heartbeat after every poll, including polls that report a known SAP problem. Version 1.7.0 also sends heartbeats on an independent one-minute Chrome alarm so a slow SAP read or notification handoff does not block them. The relay acknowledges and saves heartbeats independently of SMTP/provider delivery. If the worker responds but no SAP read succeeds for three minutes, a separate monitoring-problem alert reports the delayed check and its last activity; worker heartbeats alone do not prove SAP polling is healthy. If the relay receives no heartbeat for **three minutes**, it submits one **monitoring stopped** notification for that tenant. Its timer checks every 30 seconds, so allow that extra interval plus notification delivery time. A recovered run can generate a new alert if a later interruption occurs. Chrome being quit, the extension being disabled or its worker failing can be detected even when the extension cannot send its own warning, provided the relay and notification provider remain available (or recover for queued Discord notices).
-
-The interruption notice records the last heartbeat and last successful SAP read with dates/times in IST, the last activity, and the last reported problem when available. Old extension versions without these details remain compatible. A missing heartbeat cannot prove whether Chrome quit, the extension stopped, the computer slept or the extension-to-relay connection failed; the notice explicitly says the exact cause is unknown and does not claim SAP session expiry. The older screenshot's exact cause cannot be reconstructed from its heartbeat-only data.
-
-Manual **Stop** and normal nine-hour expiry disarm heartbeat monitoring and do not send interruption notifications. If the relay is unreachable during Stop, the cancellation is saved and retried; the relay can still report a missed heartbeat until it receives that cancellation. A stale cancellation for an old run cannot cancel a newer run for the same tenant.
-
-On a normal relay shutdown (`SIGINT`/`SIGTERM`, including Ctrl+C), the relay saves Discord notices and attempts delivery, or attempts email delivery for active tenants before exiting. Monitoring windows and undelivered notices are saved privately in `.relay-state.json.monitoring`; delivery receipts are in `.relay-state.json`. After a restart, it checks persisted windows and retries pending notices. Restarting after a missed heartbeat during a completed shift can also produce a delayed interruption alert.
-
-A relay that is force-killed, an offline computer, or an unavailable notification provider cannot send an immediate alert. Such gaps are reported after the relay/network recovers; truly immediate detection while the whole computer is offline needs an external monitor. Long Chrome alarm delays can also trigger the three-minute warning.
-
-## Error text in alerts
-
-Each new alert includes an **Error** field containing up to 2,000 characters of SAP error information. Longer errors end with `[truncated]`; open the message link for the full details. No error lookups are made for baseline messages, previously accepted IDs, unchecked statuses or artifacts outside the run’s saved selection.
-
-If SAP returns no error information, the alert says **No error information available**. A failed lookup, expired detail request or unavailable watchdog tab produces **Error details unavailable** while the message alert still sends. Detail lookups use up to five concurrent requests and a 15-second budget per lookup batch of up to 50 messages. Email delivery is still one SAP message per email. [Discarded messages have no error information according to SAP](https://help.sap.com/docs/integration-suite/isuite-integrations-and-apis/message-processing-logs), so their detail requests are skipped.
-
-## Choose notification statuses
-
-The popup offers **Failed**, **Retry**, **Processing**, **Escalated**, **Cancelled**, **Discarded** and **Abandoned** checkboxes. All seven are selected by default; Completed is always excluded. Select at least one before starting. Each tenant saves its own selection, and each card shows its alert statuses.
-
-To change an active tenant, open its monitor or watchdog tab and reopen the popup. Its saved checkboxes load automatically. Change them and click **Save statuses**. The selection takes effect on the next check without restarting the run or changing its saved artifact/package filters, end time or duplicate tracking. Other tenants keep their selections. Saved selections survive Chrome/worker restarts and load again when starting that tenant later.
-
-Enabling another status can notify you about previously unseen messages in that status within the run’s scan window. A message ID already recorded in the baseline or accepted by the relay is still suppressed, even if it changes status.
-
-## Upgrade to version 1.6.1: remove error-based archive routing
-
-Only `DISCORD_WEBHOOK_URL` is used. There is no automatic archiving, error-code rule or second webhook. Restart the relay and reload the extension to activate this change. The existing primary Discord webhook can be kept, or run `npm run setup:discord` to choose a different single channel.
-
-The relay automatically migrates the earlier two-channel outbox without dropping queued messages or delivery receipts. Pending messages that were assigned to an archive channel are sent as ordinary notifications to your configured channel. Already delivered Discord messages are left in place. Existing archive environment settings are ignored; setup removes them when saving configuration.
-
-The popup reports one queue. Receipt tracking is retained when switching providers, so previously accepted messages are not replayed to the new provider. Pending Discord notifications stay saved while email mode is selected and resume when Discord mode is enabled again.
-
-## Upgrade to version 1.5.3: heading contrast
-
-The iFlow and error headings now specify both dark text and a white background, and the email card has an explicit text color. This avoids light text inherited from a dark theme disappearing on the white email card. Restart the relay (Ctrl+C, then `npm start`) to apply this to future emails; no extension reload is needed for this rendering fix. Previously delivered emails are unchanged.
-
-## Upgrade to version 1.5.2: readable email alerts
-
-New alert subjects start with `[STATUS] iFlow name`, followed by `IS Watchdog`, the tenant and the unique SAP message ID. The HTML body shows a prominent text status badge and full iFlow heading, then tenant, time, message ID, an **Open message in SAP IS** link and error details. A plain-text alternative preserves the same information, and dynamic content is escaped in HTML. Each email still contains exactly one SAP message; Gmail filters using `IS Watchdog` and error phrases continue to match.
-
-Restart the relay in your Terminal (Ctrl+C, then `npm start`) to activate the format for future alerts. This formatting change needs no extension reload if version 1.5.1's single-message delivery is already installed. If you also reload the extension, its version shows 1.5.2. Existing emails keep their previous format and are not resent.
-
-## Upgrade to version 1.5.1: independent email alerts
-
-Version 1.5.0 combined up to 50 SAP messages in one email. A Gmail filter matching one error archived or marked the entire email as read, including unrelated errors. Version 1.5.1 sends one email per SAP message and includes that message's ID in the subject. This increases the number of emails compared with batching. The updated relay also splits requests from older extensions, and persists each successful message receipt before attempting the next so partial failures and restarts do not resend confirmed deliveries.
-
-1. Until the upgrade is active, edit error-text Gmail filters to turn off **Skip the Inbox** and **Mark as read**, so mixed emails remain visible.
-2. In the Terminal running the relay, press Ctrl+C, then run `npm start` from this project directory. A normal shutdown may send a monitoring-interruption notice for active tenants.
-3. Open `chrome://extensions` and click **Reload** on **IS Message Watchdog**. Its version should show **1.5.1**. Existing runs, filters, end times and duplicate tracking are retained; there is no need to Stop and Start a tenant.
-4. Confirm that new SAP alert emails each contain one message and have different message IDs in their subjects. You can then restore **Skip the Inbox** and **Mark as read** on your error-text Gmail filters. Gmail still controls notification behavior for each matching email.
-
-Previously emailed messages are not resent. Review older mixed emails under your error labels (and in Trash if you deleted them), since this change cannot recover missed notifications or split emails already delivered. A test email checks SMTP connectivity; the next real SAP alert checks the new per-message format.
-
-## Upgrade to version 1.5.0
-
-Restart the relay with `npm start`, then reload the extension in `chrome://extensions`. New alert emails include error details automatically; existing tenant runs and saved status/artifact selections continue. Previously emailed messages are not resent.
-
-## Upgrade to version 1.4.0
-
-Reload the extension in `chrome://extensions` to see the status checkboxes. Existing runs without a saved status selection default to all seven non-Completed statuses. If upgrading from the original failure-only extension, restart the updated relay with `npm start` too.
-
-## Upgrade to version 1.3.0
-
-Restart the relay with `npm start` and reload the extension in `chrome://extensions` to enable alerts for every status except Completed. Existing runs keep their saved artifact/package scope, end time and seen IDs, and use the broader status checks on the next poll. Stop and Start from the applied filtered page to take a fresh baseline and open a watchdog tab showing All statuses. Existing non-Completed messages in a continuing run may now generate alerts if their IDs were never recorded by the previous failure-only reader.
-
-## Upgrade from version 1.0.x
-
-Restart the relay with the updated code before reloading the extension in `chrome://extensions`. The active single-tenant run migrates automatically with its original end time, sent count and seen message IDs. Then start additional tenants from their monitor pages. No new install-time Chrome permissions are required.
-
-For the **1.1.1 iFlow filter fix**, reload the extension, Stop any existing run that should be filtered, and Start again from its filtered page after clicking Go. Older runs have no saved artifact selection and continue monitoring all iFlows until restarted.
-
-## Check the implementation
+Run the automated tests:
 
 ```sh
 npm test
 ```
-
-Automated tests cover error-text lookup and email delivery, absent/unavailable details, long UTF-8 errors, bounded concurrency, isolation of mixed errors into separate emails with distinct subjects, splitting older 50-message requests, partial-delivery retries across extension/relay restarts, per-tenant status selections, live selection updates, persistence, invalid/empty selections, simultaneous tenants with matching message IDs, selected artifact/package baselines and polls, exact IDs despite identical display names, OData escaping, pagination filtering, malformed filters, independent Stop/expiry, slow or failed tenants, permission denial/revocation, worker restart and legacy state migration, missing table refresh, and persisted delivery receipts. An end-to-end test runs the actual serialized page reader against fake SAP responses, sends requests through the real authenticated HTTP relay, and checks mail delivery with a fake SMTP transport, including exclusion of unselected iFlows. Discord tests additionally cover unfiltered single-channel cards, migration from the removed archive routing, API size limits, mention suppression, durable queues, 429/global backoff, invalid webhook pauses, restart recovery, and extension → HTTP relay → outbox → Discord cards. Tests do not create SAP messages, send real Gmail email, or post to real Discord channels.
-
-
-Earlier versions were validated live on the trial tenant, including successful failure emails and automatic SAP table refresh. Version 1.1.1's artifact and package query was also checked read-only against an authenticated tenant: HTTP 200 with a result matching both selected IDs. Filtered email delivery, concurrent tenant and outage behavior are covered by automated tests; simultaneous live tenant sessions and a full nine-hour shift still need live validation.
-
-The relay binds only to `127.0.0.1:43171`, requires its random key, fixes the email recipient in `.env`, and accepts no SMTP password from the extension. The Gmail password stays outside the extension in the local `.env`; do not commit or share it. HTTPS host access is optional: Chrome grants access only to the individual tenants approved through Start, not to all websites. The active tab is inspected when you open the popup. SAP requests and pagination stay on the selected tenant; emailed message links must match it.

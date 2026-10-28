@@ -118,10 +118,132 @@ test('one tenant session outage does not interrupt another tenant, and recovery 
   assert.equal(h.store.state.runs[TRIAL_TENANT].sent, 1);
   assert.equal(h.delivered.filter(alert => alert.kind === 'problem').length, 1);
   assert.equal(h.notices.length, 1);
+  assert.deepEqual(h.pageReloads.map(reload => reload.tabId), [h.store.state.runs[TENANT].tabId]);
   h.broken.clear(); h.sap.set(TENANT, [message('missed')]);
   await h.poll();
   assert.equal(h.store.state.runs[TENANT].status, 'Watching');
   assert.equal(h.store.state.runs[TENANT].sent, 1);
+}));
+test('session recovery reloads once, verifies SAP on the next poll, and preserves filters, baseline and counters', () => fixture(async h => {
+  const scoped = id => ({...message(id), IntegrationArtifact: {Id: 'selected-flow', PackageId: 'selected-package'}});
+  h.tabs.get(1).url += encodeURIComponent(JSON.stringify({artifactIds: ['selected-flow'], packageId: 'selected-package', edge: 'runtime-a'}));
+  h.sap.set(TENANT, [scoped('baseline')]);
+  await h.request('start', null, {sourceTabId: 1, emailStatuses: ['FAILED']});
+  const before = structuredClone(h.store.state.runs[TENANT]);
+  const tab = h.tabs.get(before.tabId);
+  const url = tab.url;
+  h.onTabReload = reloaded => {
+    assert.equal(reloaded.id, before.tabId);
+    assert.equal(h.store.state.runs[TENANT].sessionRecovery.attemptedAt, h.time);
+    h.sap.set(TENANT, [scoped('baseline'), scoped('caught-up')]); // SSO restores SAP after the reload.
+  };
+  h.sap.set(TENANT, () => new Response('', {status: 401}));
+  h.time += 60000;
+  await h.poll();
+  const recovering = h.store.state.runs[TENANT];
+  assert.equal(recovering.lastCheck, before.lastCheck);
+  assert.equal(recovering.sent, 0);
+  assert.equal(recovering.status, 'Needs attention');
+  assert.equal(recovering.phase, 'Waiting for SAP session recovery');
+  assert.match(recovering.problem, /Automatic reload attempted once/);
+  assert.match(recovering.problem, /sign-in or MFA/);
+  assert.equal(h.monitoring.at(-1).status, 'problem');
+  assert.deepEqual(h.pageReloads, [{tabId: before.tabId, url}]);
+  assert.equal(tab.active, false);
+  assert.equal(tab.autoDiscardable, false);
+  h.time += 60000;
+  await h.poll(); await h.poll();
+  const recovered = h.store.state.runs[TENANT];
+  assert.equal(recovered.lastCheck, h.time);
+  assert.equal(recovered.status, 'Watching');
+  assert.equal(recovered.problem, null);
+  assert.equal(recovered.sessionRecovery, null);
+  assert.equal(h.monitoring.at(-1).status, 'healthy');
+  assert.equal(recovered.sent, 1);
+  assert.deepEqual(recovered.seen, ['baseline', 'caught-up']);
+  for (const key of ['tabId', 'startedAt', 'scope', 'emailStatuses']) assert.deepEqual(recovered[key], before[key]);
+  assert.equal(tab.url, url);
+  assert.deepEqual(h.delivered.filter(alert => alert.kind === 'messages').map(alert => alert.messages[0].id), ['caught-up']);
+  h.sap.set(TENANT, () => new Response(null, {status: 302}));
+  await h.poll();
+  assert.equal(h.pageReloads.length, 2); // A later session outage gets its own attempt.
+}));
+test('session reload attempts survive worker restarts and do not loop while sign-in is required', () => fixture(async h => {
+  await h.start();
+  const before = structuredClone(h.store.state.runs[TENANT]);
+  const tab = h.tabs.get(before.tabId);
+  const url = tab.url;
+  h.broken.add(TENANT);
+  await h.poll(); await h.reload(); await h.poll(); await h.poll();
+  assert.equal(h.pageReloads.length, 1);
+  assert.equal(h.delivered.filter(alert => alert.kind === 'problem').length, 1);
+  assert.equal(h.notices.length, 1);
+  assert.equal(h.store.state.runs[TENANT].lastCheck, before.lastCheck);
+  tab.url = 'https://identity.example.com/login';
+  await h.poll();
+  assert.equal(h.pageReloads.length, 1);
+  assert.match(h.store.state.runs[TENANT].problem, /signing in/);
+  h.broken.clear();
+  tab.url = url;
+  h.sap.set(TENANT, () => new Response('', {status: 401}));
+  await h.poll();
+  assert.equal(h.pageReloads.length, 1); // A different auth signal is still the same unrecovered session.
+  h.sap.set(TENANT, []);
+  h.time += 60000;
+  await h.poll();
+  assert.equal(h.store.state.runs[TENANT].sessionRecovery, null);
+  assert.equal(h.store.state.runs[TENANT].status, 'Watching');
+}));
+test('failed reloads are reported and are not retried until a successful SAP check', () => fixture(async h => {
+  await h.start();
+  const {tabId} = h.store.state.runs[TENANT];
+  h.reloadFailures.add(tabId);
+  h.broken.add(TENANT);
+  await h.poll(); await h.reload(); await h.poll();
+  assert.equal(h.pageReloads.length, 1);
+  assert.equal(h.store.state.runs[TENANT].sessionRecovery.reloadFailed, true);
+  assert.match(h.store.state.runs[TENANT].problem, /Automatic reload failed/);
+  assert.match(h.notices[0].message, /Automatic reload failed/);
+  assert.equal(h.delivered.filter(alert => alert.kind === 'problem').length, 1);
+  h.reloadFailures.clear();
+  await h.poll();
+  assert.equal(h.pageReloads.length, 1);
+  h.broken.clear(); await h.poll();
+  h.broken.add(TENANT); await h.poll();
+  assert.equal(h.pageReloads.length, 2);
+}));
+test('session recovery does not reload a tab that navigated away during the failed SAP read', () => fixture(async h => {
+  await h.start();
+  const tab = h.tabs.get(h.store.state.runs[TENANT].tabId);
+  h.sap.set(TENANT, () => {
+    tab.url = 'https://identity.example.com/login';
+    return new Response('', {status: 401});
+  });
+  await h.poll();
+  assert.equal(h.pageReloads.length, 0);
+  assert.match(h.store.state.runs[TENANT].problem, /Automatic reload failed/);
+  assert.equal(tab.url, 'https://identity.example.com/login');
+}));
+test('network, permission, server, malformed-data and unrelated-page errors do not reload watchdog tabs', () => fixture(async h => {
+  await h.start();
+  for (const response of [
+    new Response('', {status: 403}), new Response('', {status: 429}), new Response('', {status: 503}),
+    new Response('invalid-json', {headers: {'content-type': 'application/json'}}),
+    new Response('not-html', {headers: {'content-type': 'text/plain'}}),
+    Response.json({d: {}})
+  ]) {
+    h.sap.set(TENANT, () => response);
+    await h.poll();
+  }
+  for (const error of [new TypeError('Failed to fetch'), new DOMException('Timed out', 'TimeoutError')]) {
+    h.sap.set(TENANT, () => {throw error;});
+    await h.poll();
+  }
+  h.denied.add(TENANT); await h.poll(); h.denied.clear();
+  h.tabs.get(h.store.state.runs[TENANT].tabId).url = 'https://example.com/';
+  await h.poll();
+  assert.equal(h.pageReloads.length, 0);
+  assert.equal(h.store.state.runs[TENANT].sessionRecovery, undefined);
 }));
 test('a slow tenant does not hold up another tenant check', () => fixture(async h => {
   await h.start(); await h.start(TRIAL_TENANT);
@@ -228,12 +350,15 @@ test('an old queued end alarm cannot stop a restarted tenant', () => fixture(asy
 test('offline Stop is persisted and retried without stopping another run', () => fixture(async h => {
   await h.start(); await h.start(TRIAL_TENANT);
   h.monitorBroken = true;
-  await h.request('stop', TENANT);
+  const stopped = await h.request('stop', TENANT);
+  assert.match(stopped.value.status, /Waiting for the relay to cancel queued alerts/);
   assert.equal(h.store.state.pendingStops.length, 1);
+  assert.equal((await h.request('status')).value.runs.find(run => run.tenant === TENANT).cancellationPending, true);
   await h.reload();
   h.monitorBroken = false;
   await h.poll();
   assert.equal(h.store.state.pendingStops.length, 0);
+  assert.equal((await h.request('status')).value.runs.find(run => run.tenant === TENANT).cancellationPending, false);
   assert.equal(h.store.state.runs[TRIAL_TENANT].running, true);
 }));
 test('heartbeat failure keeps one problem episode until the updated relay recovers', () => fixture(async h => {
@@ -518,4 +643,145 @@ test('reset retains cancellation data when the relay is offline and completes af
   assert.equal((await h.request('reset')).ok, true);
   assert.deepEqual(h.store, {});
   assert.equal(h.alarms.size, 0);
+}));
+
+for (const outcome of ['success', 'failure', 'expired session']) {
+  test(`Stop completes during a stalled SAP read and ignores its late ${outcome}`, {timeout: 5000}, () => fixture(async h => {
+    await h.start();
+    const previousCheck = h.store.state.runs[TENANT].lastCheck;
+    const tabId = h.store.state.runs[TENANT].tabId;
+    let entered, release;
+    const started = new Promise(resolve => {entered = resolve;});
+    const waiting = new Promise(resolve => {release = resolve;});
+    h.sap.set(TENANT, async () => {
+      entered(); await waiting;
+      return outcome === 'success' ? [message('late')] : outcome === 'failure'
+        ? new Response('', {status: 503}) : new Response('Login', {headers: {'content-type': 'text/html'}});
+    });
+    h.time += 60000;
+    const checking = h.poll();
+    try {
+      await started;
+      const stopped = await h.request('stop', TENANT);
+      assert.equal(stopped.ok, true);
+      const status = (await h.request('status')).value;
+      assert.equal(status.activeCount, 0);
+      assert.equal(status.runs[0].running, false);
+      assert.equal(h.awake, false);
+      assert.equal(h.alarms.has(POLL_ALARM), false);
+      assert.equal(h.alarms.has(HEARTBEAT_ALARM), false);
+      assert.equal(h.tabs.get(tabId).autoDiscardable, true);
+      assert.equal(h.monitoring.at(-1).action, 'stop');
+    } finally {release(); await checking;}
+    const run = h.store.state.runs[TENANT];
+    assert.equal(run.lastCheck, previousCheck);
+    assert.equal(run.status, 'Stopped by you');
+    assert.equal(run.phase, 'Stopped by you');
+    assert.equal(run.pendingAlerts, 0);
+    assert.equal(h.delivered.length, 0);
+    assert.equal(h.notices.length, 0);
+    assert.equal(h.pageReloads.length, 0);
+    assert.equal(h.tableClicks.length, 0);
+    assert.equal(h.monitoring.at(-1).action, 'stop');
+  }));
+}
+
+test('a stopped stalled poll does not block a new run or duplicate another tenant’s poll', {timeout: 5000}, () => fixture(async h => {
+  await h.start(); await h.start(TRIAL_TENANT);
+  let entered, release;
+  const started = new Promise(resolve => {entered = resolve;});
+  const waiting = new Promise(resolve => {release = resolve;});
+  h.sap.set(TENANT, async () => {entered(); await waiting; return [message('old-run')];});
+  const oldChecking = h.poll();
+  try {
+    await started;
+    await h.request('stop', TENANT);
+    h.time += 60000;
+    h.sap.set(TENANT, []);
+    await h.start();
+    h.sap.set(TENANT, [message('new-run')]);
+    h.sap.set(TRIAL_TENANT, [message('other-tenant')]);
+    await h.poll();
+    assert.deepEqual(h.delivered.flatMap(alert => (alert.messages || []).map(item => item.id)).sort(), ['new-run', 'other-tenant']);
+    assert.equal(h.store.state.runs[TENANT].running, true);
+  } finally {release(); await oldChecking;}
+  assert.equal(h.store.state.runs[TENANT].sent, 1);
+}));
+
+test('Stop during a relay handoff preserves the stopped state when the handoff fails late', {timeout: 5000}, async () => {
+  let entered, release;
+  const started = new Promise(resolve => {entered = resolve;});
+  const waiting = new Promise(resolve => {release = resolve;});
+  await fixture(async h => {
+    await h.start();
+    h.sap.set(TENANT, [message('in-flight'), message('must-not-send')]);
+    const checking = h.poll();
+    try {
+      await started;
+      assert.equal((await h.request('stop', TENANT)).ok, true);
+    } finally {release(); await checking;}
+    const run = h.store.state.runs[TENANT];
+    assert.equal(run.status, 'Stopped by you');
+    assert.equal(run.phase, 'Stopped by you');
+    assert.equal(run.pendingAlerts, 0);
+    assert.equal(run.sent, 0);
+    assert.equal(h.delivered.length, 1);
+    assert.equal(h.notices.length, 0);
+    assert.equal(h.monitoring.at(-1).action, 'stop');
+  }, {relayFetch: async (url, options) => {
+    if (JSON.parse(options.body || '{}').kind === 'messages') {
+      entered(); await waiting;
+      return Response.json({error: 'Late failure'}, {status: 502});
+    }
+    return Response.json({ok: true});
+  }});
+});
+
+test('Stop waits for a poll heartbeat already in flight before cancelling the relay lease', {timeout: 5000}, async () => {
+  let entered, release;
+  const started = new Promise(resolve => {entered = resolve;});
+  const waiting = new Promise(resolve => {release = resolve;});
+  const received = [];
+  await fixture(async h => {
+    await h.start();
+    const checking = h.poll();
+    let stopping;
+    try {
+      await started;
+      stopping = h.request('stop', TENANT);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(h.store.state.runs[TENANT].running, false);
+      assert.equal(received.includes('stop'), false);
+    } finally {release(); await checking; if (stopping) await stopping;}
+    assert.deepEqual(received, ['start', 'heartbeat', 'stop']);
+    assert.equal(h.store.state.runs[TENANT].status, 'Stopped by you');
+  }, {relayFetch: async (url, options) => {
+    const body = JSON.parse(options.body || '{}');
+    if (new URL(url).pathname === '/monitor') {
+      if (body.action === 'heartbeat') {entered(); await waiting;}
+      received.push(body.action);
+    }
+    return Response.json({ok: true});
+  }});
+});
+
+test('overlapping alarms reuse a stalled run check while other tenants keep polling', {timeout: 5000}, () => fixture(async h => {
+  await h.start(); await h.start(TRIAL_TENANT);
+  let entered, release, readCount = 0;
+  const started = new Promise(resolve => {entered = resolve;});
+  const waiting = new Promise(resolve => {release = resolve;});
+  h.sap.set(TENANT, async () => {readCount++; entered(); await waiting; return [];});
+  const first = h.poll();
+  let second;
+  try {
+    await started;
+    // Let the other tenant finish its first poll before firing the next alarm.
+    for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+    h.sap.set(TRIAL_TENANT, [message('next-minute')]);
+    second = h.poll();
+    for (let i = 0; i < 20 && !h.delivered.length; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(readCount, 1);
+    assert.deepEqual(h.delivered.flatMap(alert => (alert.messages || []).map(item => item.id)), ['next-minute']);
+    await h.request('stop', TENANT);
+  } finally {release(); await first; if (second) await second;}
 }));

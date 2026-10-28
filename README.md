@@ -97,13 +97,15 @@ The popup shows the current tenant and a separate bordered card for every monito
 - **Open watchdog tab** opens that tenant’s monitoring tab.
 - **Details** expands a tenant’s saved filters, alert statuses, activity, and table-refresh time.
 - **Edit statuses** expands the active tenant’s checkboxes; **Save alert statuses** applies changes on its next check. Open that tenant’s monitor or watchdog tab before editing its selection.
-- **Stop** ends only that tenant’s run. There is no automatic end time. A problem in one tenant does not stop other tenants from checking.
+- **Stop** ends only that tenant’s run and cancels its locally queued alerts for the connected Discord or Teams provider. Other tenants and new runs are independent. Alerts already accepted by the notification service cannot be recalled. There is no automatic end time. A problem in one tenant does not stop other tenants from checking.
+
+If the relay cannot confirm Stop, the popup warns that cancellation is pending and retries automatically. Keep the relay running until confirmation. The relay saves confirmed cancellations across restarts and ignores late handoffs from the stopped run. For queues saved by older relay versions without run information, Stop clears that tenant’s legacy queued alerts too.
 
 To change iFlow or package filters, stop the run, apply the new filters with **Go**, and start again. Changing filters in the original page does not update an active run.
 
 **Last successful check** records a completed SAP message API read, independently of the visible table refresh. Its age updates every second while the popup is open, even if monitoring stalls. After three minutes without a successful check, an active tenant shows **Needs attention**. Heartbeats and failed checks do not reset this timestamp.
 
-**Reset data** at the bottom of the popup stops all tenant runs and clears the extension’s saved tenants, filters, counters, duplicate tracking and relay key after confirmation. Reconnect the relay to start again. The local relay’s queued notifications and delivery history are retained. Keep the relay running during reset so monitoring cancellation can be confirmed.
+**Reset data** at the bottom of the popup stops all tenant runs and clears the extension’s saved tenants, filters, counters, duplicate tracking and relay key after confirmation. Reconnect the relay to start again. Stopping cancels those runs’ queued alerts for the connected provider; delivery history, test notices and inactive providers’ queues are retained. Keep the relay running during reset so monitoring cancellation can be confirmed.
 
 ## Monitoring start and recovery alerts
 
@@ -117,6 +119,8 @@ These notifications are saved and retried across relay restarts, and do not incr
 
 Keep Chrome, the relay, and your internet connection running, with the laptop lid open. The extension requests that the computer stay awake, but sleep, browser shutdown, or an expired SAP session can interrupt monitoring.
 
+When a SAP check returns HTTP 401, a redirect, or an HTML response that may be a login page, the extension attempts one full reload of that tenant's watchdog tab. If your SSO session can sign you back in automatically, monitoring resumes after the next successful check. Checks continue every minute; a reload alone does not count as recovery. If SAP requires sign-in or MFA, open the watchdog tab and complete it. The extension reports the interruption and reload attempt through the popup and configured alerts. It saves the attempt across Chrome/extension restarts and only allows another automatic reload after a successful SAP check. Filters, counters and duplicate tracking are preserved. Network failures, HTTP 403 permission errors and server errors do not trigger a reload, and tabs that have already left Message Monitoring are left for you to handle.
+
 The relay sends an interruption alert after roughly three minutes without an extension heartbeat, provided it can reach the notification service. Manual **Stop** does not trigger this alert. Immediate alerts are unavailable while the whole computer is offline.
 
 Teams and Discord alerts are queued on disk and retried after network failures, rate limits and server errors. Invalid or unauthorized webhooks pause delivery while retaining queued alerts. The popup's **Messages accepted by relay** count includes queued alerts; check the delivery status for confirmation. Delivery progress refreshes every two seconds while the popup is open. Switching providers leaves the old provider's outbox intact; the popup warns about these inactive queues, including rejected alerts. Connect the original provider to resume it, or explicitly transfer its pending alerts to the new destination. Preserve `.relay-state.json*` files when troubleshooting to avoid losing queued alerts and duplicate tracking. A request accepted remotely but interrupted before the relay saves its receipt can be retried and produce a duplicate notification.
@@ -124,7 +128,7 @@ Teams and Discord alerts are queued on disk and retried after network failures, 
 ## Troubleshooting and updates
 
 - **Relay unavailable or invalid key:** run `npm start`, check the Terminal for errors, and paste the key from `npm run setup` into the popup. The relay listens at `127.0.0.1:43171`.
-- **SAP sign-in or access error:** open the watchdog tab, sign in again if needed, and return to **Monitor Message Processing**. Checks retry every minute.
+- **SAP sign-in or access error:** session errors trigger one automatic watchdog-tab reload. If monitoring still needs attention, open the watchdog tab, sign in again if needed, and return to **Monitor Message Processing**. HTTP 403 requires checking your monitoring permissions or signing in again. Checks retry every minute.
 - **Watchdog tab closed:** stop the affected run and start it again from the tenant’s monitor page.
 - **Discord delivery paused:** check the popup’s delivery error. For an invalid or deleted webhook, rerun `npm run setup:discord` and restart the relay.
 - **Teams delivery paused:** check the popup's delivery error. For an invalid, disabled or deleted webhook, fix/recreate the workflow, rerun `npm run setup:teams` with its new URL and restart the relay. HTTP 401/403 can also mean the workflow requires Microsoft authentication; use the **Anyone** option if your organization permits it.
@@ -134,6 +138,10 @@ Teams and Discord alerts are queued on disk and retried after network failures, 
 Version **1.8.1** improves tenant separation and moves relay settings into their own tab. Reload the extension to apply this UI update; no relay restart is needed when upgrading from 1.8.0.
 
 Version **1.9.0** adds Microsoft Teams Workflows delivery, durable retries and Teams delivery status in the popup. Restart the relay and reload the extension after upgrading. Teams setup preserves your existing relay key, so reconnecting is unnecessary if it is already saved.
+
+Version **1.9.1** adds one automatic watchdog-tab reload per SAP session interruption, with recovery verified by a successful SAP check. Click **Reload** for the extension in `chrome://extensions` to apply it. No relay restart is needed when upgrading from 1.9.0.
+
+Version **1.9.2** makes Stop cancel a run’s locally queued Discord and Teams alerts and prevents late handoffs from restarting delivery. The popup warns while relay cancellation is pending. Restart the relay and reload the extension to apply this update. Notifications already accepted by Discord or Teams cannot be recalled.
 
 ## Development
 

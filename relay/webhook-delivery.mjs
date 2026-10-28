@@ -21,9 +21,24 @@ export async function createWebhookDelivery({webhook: destinationURL, stateFile,
   catch (error) {if (error.code !== 'ENOENT') throw error;}
   state = migrate(state);
   if (state.version !== 2 || !state.pending || !state.receipts || !state.destination) throw new Error(`Invalid ${label} outbox state. Preserve the file and restore it from backup.`);
+  state.cancelledRuns ||= {};
+  // Older outboxes have only a formatted payload. Recover the tenant so Stop
+  // also clears those alerts; their original run cannot be recovered.
+  for (const job of Object.values(state.pending)) {
+    if (!job.tenant) {
+      const link = job.payload?.embeds?.[0]?.url || job.payload?.attachments?.[0]?.content?.actions?.[0]?.url;
+      try {job.tenant = new URL(link).origin;} catch { /* Test notices have no tenant. */ }
+    }
+  }
+  const cancelledRuns = new Set(Object.keys(state.cancelledRuns));
+  const cancelledTenants = new Set([...cancelledRuns].map(key => key.slice(0, key.lastIndexOf(':'))));
+  const runKey = (tenant, run) => `${tenant}:${run}`;
+  const isCancelled = (tenant, run) => cancelledRuns.has(runKey(tenant, run));
+  const cancelledJob = job => isCancelled(job.tenant, job.run) ||
+    (!Number.isSafeInteger(job.run) && cancelledTenants.has(job.tenant));
   state.receipts = Object.fromEntries(Object.entries(state.receipts).filter(([, time]) => time > now() - 30 * 86400000));
   if (state.destination.identity !== hash(destinationURL)) state.destination = {identity: hash(destinationURL), nextAt: 0, error: null, blocked: false};
-  let writes = Promise.resolve(), pumping, timer, running = false, stopped = false, controller, fatalError = null;
+  let writes = Promise.resolve(), pumping, timer, running = false, stopped = false, controller, activeJob, fatalError = null;
   function change(operation) {
     const result = writes.then(async () => {
       const next = structuredClone(state);
@@ -45,7 +60,7 @@ export async function createWebhookDelivery({webhook: destinationURL, stateFile,
       blocked: state.destination.blocked};
   }
   function dueJob() {
-    const eligible = job => !job.failed && !state.destination.blocked &&
+    const eligible = job => !job.failed && !cancelledJob(job) && !state.destination.blocked &&
       Math.max(state.destination.nextAt, state.globalUntil) <= now();
     const jobs = Object.values(state.pending);
     return jobs.find(job => job.priority && eligible(job)) || jobs.find(eligible);
@@ -53,7 +68,7 @@ export async function createWebhookDelivery({webhook: destinationURL, stateFile,
   function schedule() {
     if (!running || stopped || pumping) return;
     clearTimeout(timer);
-    const ready = Object.values(state.pending).filter(job => !job.failed && !state.destination.blocked);
+    const ready = Object.values(state.pending).filter(job => !job.failed && !cancelledJob(job) && !state.destination.blocked);
     if (!ready.length) return;
     const next = ready.reduce((earliest, job) => Math.min(earliest, Math.max(state.destination.nextAt, state.globalUntil)), Infinity);
     timer = setTimeout(() => flush().catch(() => {}), Math.min(60000, Math.max(0, next - now())));
@@ -61,6 +76,7 @@ export async function createWebhookDelivery({webhook: destinationURL, stateFile,
   }
   async function attempt(job) {
     let response, body;
+    activeJob = job;
     controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     try {
@@ -68,10 +84,13 @@ export async function createWebhookDelivery({webhook: destinationURL, stateFile,
         headers: {'Content-Type': 'application/json'}, body: JSON.stringify(job.payload)});
       body = await response.json().catch(() => null);
     } catch { /* Persist a retry without exposing the webhook URL or response body. */ }
-    finally {clearTimeout(timeout); controller = null;}
+    finally {clearTimeout(timeout); controller = null; activeJob = null;}
     await change(next => {
       const route = next.destination;
       const current = next.pending[job.key];
+      // Stop may remove the alert while a request is in flight. Do not revive
+      // it, count it as delivered, or apply an aborted request's retry delay.
+      if (!current || cancelledJob(current)) return;
       if (response && isAccepted(response, body)) {
         next.receipts[job.key] = now();
         delete next.pending[job.key];
@@ -115,17 +134,37 @@ export async function createWebhookDelivery({webhook: destinationURL, stateFile,
     return pumping;
   }
   return {
-    status, flush,
-    async enqueue(alert) {
-      const key = deliveryKey(provider, alert);
-      const payload = formatMessage(alert);
-      const duplicate = await change(next => {
-        if (next.receipts[key] || next.pending[key]) return true;
-        next.pending[key] = {key, payload, priority: ['problem', 'stopped', 'started', 'resumed'].includes(alert.kind), attempts: 0, acceptedAt: now()};
-        return false;
+    status, flush, isCancelled,
+    async cancelRun(tenant, run) {
+      // Gate dispatch immediately, even while an earlier disk write finishes.
+      const key = runKey(tenant, run);
+      cancelledRuns.add(key);
+      cancelledTenants.add(tenant);
+      if (activeJob && cancelledJob(activeJob)) controller?.abort();
+      const cancelled = await change(next => {
+        next.cancelledRuns[key] = now();
+        let count = 0;
+        for (const [key, job] of Object.entries(next.pending)) {
+          if (cancelledJob(job)) {delete next.pending[key]; count++;}
+        }
+        return count;
       });
       schedule();
-      return {ok: true, queued: !duplicate, duplicate, provider};
+      return {ok: true, cancelled};
+    },
+    async enqueue(alert) {
+      if (isCancelled(alert.tenant, alert.run)) return {ok: true, queued: false, cancelled: true, provider};
+      const key = deliveryKey(provider, alert);
+      const payload = formatMessage(alert);
+      const result = await change(next => {
+        if (isCancelled(alert.tenant, alert.run)) return {queued: false, cancelled: true};
+        if (next.receipts[key] || next.pending[key]) return {queued: false, duplicate: true};
+        next.pending[key] = {key, payload, tenant: alert.tenant, run: alert.run,
+          priority: ['problem', 'stopped', 'started', 'resumed'].includes(alert.kind), attempts: 0, acceptedAt: now()};
+        return {queued: true, duplicate: false};
+      });
+      schedule();
+      return {ok: true, ...result, provider};
     },
     start() {stopped = false; running = autoDispatch; schedule();},
     stop() {stopped = true; running = false; clearTimeout(timer); controller?.abort();}

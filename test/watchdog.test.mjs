@@ -107,6 +107,7 @@ test('script envelopes identify authentication redirects without following them 
       return response;
     }, () => readNonCompletedMessages(Date.now(), TENANT, {}, undefined, true));
     assert.equal(result.ok, false);
+    assert.equal(result.code, 'SAP_SESSION_EXPIRED');
     assert.match(result.error, /SAP redirected the monitoring request/);
   }
   const malformed = await withSAP(async () => new Response('private-response', {headers: {'content-type': 'application/json'}}),
@@ -114,6 +115,32 @@ test('script envelopes identify authentication redirects without following them 
   assert.equal(malformed.ok, false);
   assert.match(malformed.error, /invalid JSON/);
   assert.doesNotMatch(malformed.error, /private-response/);
+  assert.equal(malformed.code, undefined);
+});
+test('only authentication responses carry the session recovery code across the page-script boundary', async () => {
+  for (const response of [
+    new Response('private-login', {status: 401}),
+    new Response('private-login', {headers: {'content-type': 'text/html; charset=utf-8'}}),
+    new Response('private-login', {headers: {'content-type': 'application/xhtml+xml'}})
+  ]) {
+    const result = await withSAP(async () => response, () => readNonCompletedMessages(Date.now(), TENANT, {}, undefined, true));
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'SAP_SESSION_EXPIRED');
+    assert.doesNotMatch(result.error, /private-login/);
+  }
+  for (const response of [
+    new Response('', {status: 403}), new Response('', {status: 429}), new Response('', {status: 503}),
+    new Response('private-other', {headers: {'content-type': 'text/plain'}}), json({d: {}})
+  ]) {
+    const result = await withSAP(async () => response, () => readNonCompletedMessages(Date.now(), TENANT, {}, undefined, true));
+    assert.equal(result.ok, false);
+    assert.equal(result.code, undefined);
+    assert.doesNotMatch(result.error, /private-other/);
+  }
+  const offline = await withSAP(async () => {throw new TypeError('Failed to fetch');},
+    () => readNonCompletedMessages(Date.now(), TENANT, {}, undefined, true));
+  assert.equal(offline.ok, false);
+  assert.equal(offline.code, undefined);
 });
 test('selected statuses constrain SAP queries and every response page together with artifact filters', async () => {
   const selected = (id, status = 'FAILED', artifact = 'flow-a') => ({...item(id, status), IntegrationArtifact: {Id: artifact}});

@@ -100,6 +100,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     return result;
   }
   async function deliver(alert) {
+    if (delivery?.isCancelled?.(alert.tenant, alert.run)) return {ok: true, cancelled: true};
     const key = alertKey(alert);
     if (receipts[key]) return {ok: true, duplicate: true};
     const isMessageBatch = ['messages', 'failures'].includes(alert.kind);
@@ -116,7 +117,8 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     if (delivery) {
       // The outbox must be durable before acknowledging this message to Chrome.
       // Queue deduplication also protects a retry if the receipt write below fails.
-      await delivery.enqueue(filtered);
+      const accepted = await delivery.enqueue(filtered);
+      if (accepted.cancelled) return accepted;
     } else {
       const mail = composeEmail(filtered);
       const info = await transport.sendMail({from: user, to: recipient, ...mail});
@@ -129,6 +131,16 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     return {ok: true, ...(delivery ? {queued: true, provider: deliveryProvider} : {})};
   }
   const monitor = await createMonitoringWatch({stateFile: monitorFile, sendAlert: alert => serialize(() => deliver(alert)), now});
+  async function receiveMonitor(update) {
+    if (update.action === 'stop') {
+      // Outbox cancellation has its own short disk lock, so a slow webhook
+      // request cannot hold up Stop or allow the backlog to keep draining.
+      await delivery?.cancelRun?.(update.tenant, update.run);
+    } else if (delivery?.isCancelled?.(update.tenant, update.run)) {
+      return {ok: true, cancelled: true};
+    }
+    return monitor.receive(update);
+  }
   function monitorOperation(operation) {
     const result = monitorQueue.then(operation);
     monitorQueue = result.catch(() => {});
@@ -162,7 +174,7 @@ export async function createRelay({token, user, recipient, transport, stateFile 
     }
     catch { return reply(400, {error: 'Invalid alert request'}); }
     // Heartbeat receipts must not wait behind SMTP/provider delivery or notice retries.
-    const result = request.url === '/monitor' ? monitor.receive(alert) : serialize(() => deliver(alert));
+    const result = request.url === '/monitor' ? receiveMonitor(alert) : serialize(() => deliver(alert));
     try {
       const value = await result;
       // Dispatch persisted lifecycle events promptly, outside the heartbeat request.

@@ -21,7 +21,10 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
   const monitoring = [];
   const notices = [];
   const tableClicks = [];
+  const pageReloads = [];
+  const reloadFailures = new Set();
   const reads = [];
+  let onTabReload;
   let refreshAvailable = true;
   let emailBroken = false;
   let monitorBroken = false;
@@ -37,6 +40,12 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
       async query() {return [tabs.get(1)];},
       async get(id) {if (!tabs.has(id)) throw new Error('No tab'); return tabs.get(id);},
       async update(id, options) {const tab = await this.get(id); Object.assign(tab, options); return tab;},
+      async reload(id) {
+        const tab = await this.get(id);
+        pageReloads.push({tabId: id, url: tab.url});
+        if (reloadFailures.has(id)) throw new Error('Reload unavailable');
+        await onTabReload?.(tab);
+      },
       async create(options) {const id = Math.max(...tabs.keys()) + 1; const tab = {id, ...options}; tabs.set(id, tab); return tab;}
     },
     permissions: {async contains({origins}) {return !denied.has(origins[0].slice(0, -2));}},
@@ -107,10 +116,11 @@ export async function backgroundHarness({saved, relayFetch} = {}) {
   }
   await reload();
   return {
-    store, tabs, sap, sapErrors, broken, denied, alarms, delivered, monitoring, notices, tableClicks, reads, errorReads, request, reload,
+    store, tabs, sap, sapErrors, broken, denied, alarms, delivered, monitoring, notices, tableClicks, pageReloads, reloadFailures, reads, errorReads, request, reload,
     set time(value) {clock = value;}, get time() {return clock;}, get awake() {return keepAwake;},
     set emailBroken(value) {emailBroken = value;}, set monitorBroken(value) {monitorBroken = value;},
     set refreshAvailable(value) {refreshAvailable = value;},
+    set onTabReload(value) {onTabReload = value;},
     async start(tenant = TENANT) {
       let source = [...tabs.values()].find(tab => new URL(tab.url).origin === tenant);
       if (!source) {source = {id: Math.max(...tabs.keys()) + 1, url: `${tenant}/shell/monitoring/Messages/`}; tabs.set(source.id, source);}

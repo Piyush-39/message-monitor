@@ -154,7 +154,8 @@ function tenantCard(run) {
   card.append(problem);
   runClocks.push(() => {
     time.textContent = relativeTime(run.lastCheck);
-    const warning = run.running && runProblem(run);
+    const warning = run.running ? runProblem(run) : run.cancellationPending ?
+      'Monitoring stopped. Relay cancellation is pending; queued alerts may still arrive. Keep the relay running to confirm cancellation.' : null;
     health.className = `run-state${!run.running ? ' stopped' : warning ? ' problem' : ''}`;
     healthText.textContent = !run.running ? 'Stopped' : warning ? 'Needs attention' : 'Monitoring';
     problem.textContent = warning || '';
@@ -178,7 +179,7 @@ function tenantCard(run) {
     ...(run.lastCheck ? [`Last successful check: ${new Date(run.lastCheck).toLocaleString()}`] : []),
     ...(run.lastRefresh ? [`Last table refresh: ${new Date(run.lastRefresh).toLocaleString()}`] : []),
     ...(run.running && run.phase ? [`Activity: ${run.phase}`] : []),
-    ...(run.pendingAlerts ? [`Alerts awaiting handoff: ${run.pendingAlerts}. Retrying on the next check.`] : []),
+    ...(run.running && run.pendingAlerts ? [`Alerts awaiting handoff: ${run.pendingAlerts}. Retrying on the next check.`] : []),
     ...(run.tableRefresh === false ? ['Table refresh unavailable; alert checks continue.'] : [])
   ].join('\n');
   const toggleDetails = () => {

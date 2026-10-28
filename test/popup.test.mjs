@@ -186,6 +186,21 @@ test('a popup opened after checks stopped immediately shows the actual age and o
   } finally {h.close();}
 });
 
+test('stopped monitoring explains when relay cancellation is pending instead of claiming alert handoffs will retry', async () => {
+  const h = await popupHarness({state: {runs: [{tenant: TENANT, running: false, cancellationPending: true, pendingAlerts: 10}], activeCount: 0, relay: {connected: false}}});
+  try {
+    const card = h.elements.runs.children[0];
+    const problem = flatten(card).find(node => node.className === 'run-problem');
+    assert.equal(problem.hidden, false);
+    assert.match(problem.textContent, /Relay cancellation is pending; queued alerts may still arrive/);
+    assert.doesNotMatch(text(card), /Alerts awaiting handoff/);
+    h.state.runs[0].cancellationPending = false;
+    await h.elements.token.change();
+    const confirmed = flatten(h.elements.runs.children[0]).find(node => node.className === 'run-problem');
+    assert.equal(confirmed.hidden, true);
+  } finally {h.close();}
+});
+
 test('popup clearly shows missing tenant and relay setup, and key visibility stays local', async () => {
   const h = await popupHarness({url: 'https://example.com/', savedToken: '', state: {runs: [], activeCount: 0, relay: {connected: false, error: 'Add your notification relay key in Relay settings.'}}});
   try {

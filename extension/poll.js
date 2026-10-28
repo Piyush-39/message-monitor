@@ -22,6 +22,7 @@ export function refreshMessageTable(expectedOrigin) {
 export async function readNonCompletedMessages(since, expectedOrigin, scope = {}, emailStatuses, reportErrors = false) {
   // Chrome can drop MAIN-world exceptions from executeScript results. Return a
   // plain envelope across that boundary so the actual SAP failure survives.
+  const sessionError = message => Object.assign(new Error(message), {code: 'SAP_SESSION_EXPIRED'});
   async function read() {
     const origin = location.origin;
     if (origin !== expectedOrigin) {
@@ -68,12 +69,15 @@ export async function readNonCompletedMessages(since, expectedOrigin, scope = {}
         if (globalThis.navigator?.onLine === false) throw new Error('Chrome is offline. Reconnect this computer to resume SAP checks automatically.');
         throw new Error('SAP request failed before an HTTP response arrived. Check network/VPN and tenant availability; session expiry is not confirmed. Checks retry every minute.');
       }
-      if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) throw new Error('SAP redirected the monitoring request instead of returning messages. The session may have expired. Sign in again in the watchdog tab; checks retry every minute.');
-      if (response.status === 401) throw new Error('SAP rejected the session (HTTP 401). Sign in again in the watchdog tab; checks retry every minute.');
+      if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) throw sessionError('SAP redirected the monitoring request instead of returning messages. The session may have expired. Sign in again in the watchdog tab; checks retry every minute.');
+      if (response.status === 401) throw sessionError('SAP rejected the session (HTTP 401). Sign in again in the watchdog tab; checks retry every minute.');
       if (response.status === 403) throw new Error('SAP denied monitoring access (HTTP 403). Check your SAP monitoring permissions or sign in again. Checks retry every minute.');
       if (!response.ok) throw new Error(`SAP monitoring returned HTTP ${response.status}. ${response.status === 429 ? 'SAP is limiting requests.' : 'The tenant could not complete the request.'} Checks retry every minute.`);
-      if (!(response.headers.get('content-type') || '').includes('json')) {
-        throw new Error('SAP returned a login page or other non-JSON response instead of messages. Sign in again in the watchdog tab if prompted; checks retry every minute.');
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      if (!contentType.includes('json')) {
+        const message = 'SAP returned a login page or other non-JSON response instead of messages. Sign in again in the watchdog tab if prompted; checks retry every minute.';
+        if (/^(?:text\/html|application\/xhtml\+xml)(?:;|$)/.test(contentType)) throw sessionError(message);
+        throw new Error(message);
       }
       let body;
       try {body = await response.json();}
@@ -107,7 +111,8 @@ export async function readNonCompletedMessages(since, expectedOrigin, scope = {}
     return reportErrors ? {ok: true, messages} : messages;
   } catch (error) {
     if (!reportErrors) throw error;
-    return {ok: false, error: String(error.message || error).slice(0, 400)};
+    return {ok: false, error: String(error.message || error).slice(0, 400),
+      ...(error.code === 'SAP_SESSION_EXPIRED' ? {code: error.code} : {})};
   }
 }
 

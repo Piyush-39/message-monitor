@@ -63,7 +63,7 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
     ].join('\n'), true);
   }
   async function sendEvents(lease) {
-    while (lease.events.length) {
+    while (!lease.cancelled && lease.events.length) {
       const event = lease.events[0];
       await sendAlert({...event, tenant: lease.tenant, run: lease.run});
       lease.events.shift();
@@ -76,9 +76,10 @@ export async function createMonitoringWatch({stateFile, sendAlert, now = Date.no
       const previous = leases[key];
       if (update.action === 'stop') {
         if (previous) {
-          // Accepted lifecycle notices still deliver if the user stops immediately.
+          // A manual Stop also cancels lifecycle notices still waiting locally.
           previous.cancelled = true;
-          if (!previous.events.length) delete leases[key];
+          previous.events = [];
+          delete leases[key];
         }
       } else if (!previous?.cancelled) {
         if (previous && update.lastCheck < previous.lastCheck) {

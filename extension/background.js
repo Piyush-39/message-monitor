@@ -6,6 +6,8 @@ let state;
 let queue = Promise.resolve();
 let writes = Promise.resolve();
 const heartbeatTasks = new Map();
+const pollTasks = new Map();
+const monitorTasks = new Map();
 function serialize(operation) {
   const result = queue.then(operation);
   queue = result.catch(() => {});
@@ -35,10 +37,18 @@ async function relay(path, token, body) {
   return response.json();
 }
 function heartbeat(run, action = 'heartbeat', status = run.problem ? 'problem' : 'healthy') {
-  return relay('/monitor', run.token, {
+  if (!activeRun(run)) return Promise.resolve();
+  const tasks = monitorTasks.get(run) || new Set();
+  monitorTasks.set(run, tasks);
+  const task = relay('/monitor', run.token, {
     action, tenant: run.tenant, run: run.startedAt, endsAt: run.endsAt,
     lastCheck: run.lastCheck, status, phase: run.phase || 'Waiting for next check', problem: status === 'problem' ? run.problem : null
+  }).finally(() => {
+    tasks.delete(task);
+    if (!tasks.size) monitorTasks.delete(run);
   });
+  tasks.add(task);
+  return task;
 }
 async function read(run, since) {
   const {tenant, tabId} = run;
@@ -53,9 +63,32 @@ async function read(run, since) {
   try {result = await chrome.scripting.executeScript({target: {tabId}, world: 'MAIN', func: readNonCompletedMessages, args: [since, tenant, run.scope || {}, emailStatuses(run.emailStatuses), true]});}
   catch {throw new Error('Chrome could not run the SAP check in the watchdog tab. It may be reloading or inaccessible. Open that Message Monitoring tab; checks retry every minute.');}
   const response = result[0]?.result;
-  if (response?.ok === false) throw new Error(response.error);
+  if (response?.ok === false) throw Object.assign(new Error(response.error), {code: response.code});
   if (!response?.ok || !Array.isArray(response.messages)) throw new Error('The watchdog tab did not return a SAP check result. It may have reloaded during the check. Checks retry every minute.');
   return response.messages;
+}
+async function recoverSession(run, error) {
+  if (error.code !== 'SAP_SESSION_EXPIRED' || !activeRun(run)) return error;
+  if (!run.sessionRecovery) {
+    // Persist before reloading: a worker/browser restart must not retry this
+    // attempt until a successful SAP read proves the session recovered.
+    run.sessionRecovery = {attemptedAt: Date.now(), reloadFailed: false};
+    run.phase = 'Reloading SAP watchdog tab to restore session';
+    await save();
+    if (!activeRun(run)) return error;
+    try {
+      const tab = await chrome.tabs.get(run.tabId);
+      if (!activeRun(run)) return error;
+      // Never reload a sign-in form or a page the user navigated to meanwhile.
+      if (monitorTenant(tab.url) !== run.tenant) throw new Error('Watchdog tab left Message Monitoring.');
+      await chrome.tabs.reload(run.tabId);
+    } catch {run.sessionRecovery.reloadFailed = true;}
+  }
+  if (!activeRun(run)) return error;
+  run.phase = 'Waiting for SAP session recovery';
+  const recovery = run.sessionRecovery.reloadFailed ? 'Automatic reload failed. Open the watchdog tab.' :
+    'Automatic reload attempted once. Open the watchdog tab if sign-in or MFA is required.';
+  return new Error(`${error.message} ${recovery}`);
 }
 async function withErrorDetails(run, messages) {
   let errors;
@@ -97,15 +130,17 @@ async function stop(tenant, reason = 'Stopped by you') {
   run.running = false;
   run.status = reason;
   run.phase = reason;
+  run.pendingAlerts = 0;
   state.pendingStops.push({tenant, run: run.startedAt, token: run.token});
   await save();
   await chrome.alarms.clear(endAlarm(tenant));
   // An already-sent heartbeat must finish before cancellation, or it could rearm the relay.
-  await heartbeatTasks.get(tenant)?.catch(() => {});
+  await Promise.allSettled([heartbeatTasks.get(tenant), ...(monitorTasks.get(run) || [])]);
   if (run.restoreAutoDiscardable) await chrome.tabs.update(run.tabId, {autoDiscardable: true}).catch(() => {});
   await flushStops();
   await updateControls();
-  return {status: reason};
+  const pending = state.pendingStops.some(item => item.tenant === tenant && item.run === run.startedAt);
+  return {status: pending ? `${reason}. Waiting for the relay to cancel queued alerts.` : reason};
 }
 async function resetData() {
   for (const run of Object.values(state.runs).filter(activeRun)) {
@@ -160,15 +195,22 @@ async function tick(run) {
     const deadline = Date.now() + 45000;
     run.phase = 'Reading SAP messages';
     const messages = await read(run, run.startedAt - 5 * 60 * 1000);
+    if (!activeRun(run)) return;
     run.lastCheck = Date.now();
     run.lastCheckAlerts = 0;
+    run.sessionRecovery = null;
     await save();
+    if (!activeRun(run)) return;
     // Keep UI/session activity ahead of potentially slow notification delivery.
     try {
       const refreshed = await chrome.scripting.executeScript({target: {tabId: run.tabId}, world: 'MAIN', func: refreshMessageTable, args: [run.tenant]});
+      if (!activeRun(run)) return;
       run.tableRefresh = refreshed[0]?.result === true;
       if (run.tableRefresh) run.lastRefresh = Date.now();
-    } catch {run.tableRefresh = false;}
+    } catch {
+      if (!activeRun(run)) return;
+      run.tableRefresh = false;
+    }
     const fresh = unseenMessages(messages, run.seen);
     run.pendingAlerts = fresh.length;
     delivery: for (let offset = 0; offset < fresh.length; offset += 50) {
@@ -183,6 +225,7 @@ async function tick(run) {
         if (!activeRun(run)) return;
         run.phase = 'Handing message alerts to notification relay';
         await relay('/alert', run.token, {kind: 'messages', run: run.startedAt, tenant: run.tenant, messages: [message]});
+        if (!activeRun(run)) return;
         run.seen.push(message.id);
         run.sent++;
         run.lastCheckAlerts++;
@@ -193,13 +236,17 @@ async function tick(run) {
     if (!activeRun(run)) return;
     run.phase = 'Waiting for next check';
     await heartbeat(run, 'heartbeat', 'healthy');
+    if (!activeRun(run)) return;
     run.problem = null;
     run.problemEpisode = null;
     run.status = 'Watching';
     await save();
-  } catch (error) {await reportProblem(run, error);}
+  } catch (error) {
+    if (activeRun(run)) await reportProblem(run, await recoverSession(run, error));
+  }
 }
 async function reportProblem(run, error) {
+  if (!activeRun(run)) return;
   const problem = String(error.message || error).slice(0, 400);
   const first = !run.problemEpisode || run.problem !== problem;
   run.problem = problem;
@@ -207,26 +254,39 @@ async function reportProblem(run, error) {
   if (first) run.problemEpisode = {id: Math.max(Date.now(), (run.problemEpisode?.id || 0) + 1), sent: false};
   const episode = run.problemEpisode;
   await save();
+  if (!activeRun(run)) return;
   // Record the known cause before attempting potentially slow alert delivery.
   await heartbeat(run).catch(() => {});
+  if (!activeRun(run)) return;
   if (first) await chrome.notifications.create(`is-watchdog-problem:${run.tenant}`, {
     type: 'basic', iconUrl: 'icon.png', title: `IS monitoring: ${new URL(run.tenant).hostname}`, message: problem
   }).catch(() => {});
+  if (!activeRun(run)) return;
   if (!episode.sent) {
     try {
       await relay('/alert', run.token, {kind: 'problem', run: run.startedAt, tenant: run.tenant, episode: episode.id, problem});
+      if (!activeRun(run)) return;
       episode.sent = true;
       await save();
     } catch { /* Retry each minute without marking a failed delivery as sent. */ }
   }
 }
 async function tickAll() {
-  const results = await Promise.allSettled([flushStops(), ...Object.values(state.runs).filter(run => run.running).map(tick)]);
+  const results = await Promise.allSettled([flushStops(), ...Object.values(state.runs).filter(activeRun).map(run => {
+    // Polls may outlive a Stop or Reset. Share only the task for this run, so a
+    // stalled old check cannot block controls, other tenants or a new run.
+    if (!pollTasks.has(run)) {
+      const task = tick(run).finally(() => pollTasks.delete(run));
+      pollTasks.set(run, task);
+    }
+    return pollTasks.get(run);
+  })]);
   for (const result of results) if (result.status === 'rejected') console.error('Tenant check could not finish:', result.reason?.message);
   await updateControls();
 }
 function publicState() {
   const runs = Object.values(state.runs).map(({token, seen, ...run}) => ({...run, running: activeRun(run),
+    cancellationPending: state.pendingStops.some(item => item.tenant === run.tenant && item.run === run.startedAt),
     emailStatuses: emailStatuses(run.emailStatuses),
     status: run.status}));
   return {runs, activeCount: runs.filter(run => activeRun(run)).length};
@@ -247,10 +307,10 @@ chrome.alarms.onAlarm.addListener(alarm => {
     }
     return;
   }
-  return serialize(async () => {
-    if (alarm.name === POLL_ALARM) return tickAll();
-    // Ignore end alarms already queued by an earlier extension version.
-  }).catch(console.error);
+  // Polling must never occupy the control queue: executeScript can remain
+  // pending indefinitely in a stalled SAP tab, and Stop must still take effect.
+  if (alarm.name === POLL_ALARM) return initialized.then(tickAll).catch(console.error);
+  // Ignore end alarms already queued by an earlier extension version.
 });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || sender.tab) return;
@@ -302,7 +362,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     throw new Error('Unknown action');
   };
   // A hung SAP read or notification handoff must not hide the last completed
-  // check from the popup. Mutations still run in order after initialization.
+  // check from the popup. Button actions run in order independently of polls.
   (message.type === 'status' ? initialized.then(operation) : serialize(operation))
     .then(value => respond({ok: true, value}), error => respond({ok: false, error: error.message}));
   return true;
